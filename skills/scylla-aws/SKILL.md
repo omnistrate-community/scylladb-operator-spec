@@ -19,9 +19,10 @@ All commands use `omnistrate-ctl` (alias `omctl`); log in first with
 
 | File | What it is |
 |---|---|
-| `spec-operator.yaml` | ScyllaDB ServicePlanSpec: `ScyllaCluster` on local NVMe + CQL load balancer + lifecycle workflows. **Generated** — see "Editing" |
+| `spec-operator.yaml` | ScyllaDB ServicePlanSpec: `ScyllaCluster` on local NVMe with one internet-facing load balancer per member, lifecycle workflows, and the `nlbSecurityGroup` Terraform resource |
 | `spec-s3-bucket.yaml` | Terraform-backed service that creates one S3 bucket + an IAM user/access key scoped to it |
 | `terraform/main.tf` | The Terraform module used by `spec-s3-bucket.yaml` |
+| `terraform-nlb-sg/main.tf` | Terraform module of the `nlbSecurityGroup` resource: the load balancers' security group, one per instance |
 | `amenities.yaml` | Deployment-cell config: managed amenities + ScyllaDB Operator, Scylla Manager and the `ScyllaSnapshot` CRD |
 
 How it fits together:
@@ -32,8 +33,11 @@ s3-bucket instance ──outputs──► bucketName, bucketRegion, accessKeyId,
                                         ▼
 ScyllaDB instance ── ScyllaCluster <id>: N members, one per i4i/i3en/... node, data on local NVMe
    │                   │  Manager agent sidecar ──backups──► s3://<bucket>/backup/...
-   │                   └─ ops Jobs (kubectl + sctool) drive backup/restore/stop/start/replace
-   └── TCP LB cqllb:9042 → cqlProxy (socat) → <id>-client:9042
+   │                   ├─ ops Jobs (kubectl + sctool) drive backup/restore/stop/start/replace
+   │                   └─ one internet-facing NLB per member (security group: 9042, 19042, 10001)
+   │                        node-<n>.<instance zone> ──► member n   (external-dns)
+   │                        <endpoint> (list-endpoints) ──► member 0   = contact point
+   └── nlbSecurityGroup (Terraform) ── creates that security group in the cell's VPC
 cell amenities: scylla-operator · scylla-manager (+ its own 1-node Scylla on EBS) · ScyllaSnapshot CRD
 ```
 
@@ -46,13 +50,14 @@ Run every command from a working copy of this skill folder
 (`artifactsLocalPath` in `spec-s3-bucket.yaml` is resolved from the current
 directory).
 
-### 1. One-time: let Omnistrate's Terraform create buckets and IAM users
+### 1. One-time: let Omnistrate's Terraform create buckets, IAM users and security groups
 
 Hosted Terraform runs as the IAM role `omnistrate-terraform-execution-role` in
 your AWS account. If that role doesn't already have broad permissions
 (`aws iam list-attached-role-policies --role-name omnistrate-terraform-execution-role`),
 grant it S3 and IAM-user permissions scoped to the `scylla-backup-*` names the
-module uses:
+bucket module uses, plus security-group permissions for the load balancers'
+security group:
 
 ```bash
 ACCOUNT=<aws-account-id>
@@ -67,7 +72,14 @@ cat > scylla-backup-tf-policy.json <<POLICY
                  "iam:ListUserTags", "iam:PutUserPolicy", "iam:GetUserPolicy", "iam:DeleteUserPolicy",
                  "iam:ListUserPolicies", "iam:ListAttachedUserPolicies", "iam:ListGroupsForUser",
                  "iam:CreateAccessKey", "iam:DeleteAccessKey", "iam:ListAccessKeys"],
-      "Resource": "arn:aws:iam::${ACCOUNT}:user/scylla-backup-*" }
+      "Resource": "arn:aws:iam::${ACCOUNT}:user/scylla-backup-*" },
+    { "Effect": "Allow",
+      "Action": ["ec2:CreateSecurityGroup", "ec2:DeleteSecurityGroup", "ec2:DescribeSecurityGroups",
+                 "ec2:DescribeSecurityGroupRules", "ec2:AuthorizeSecurityGroupIngress",
+                 "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupIngress",
+                 "ec2:RevokeSecurityGroupEgress", "ec2:CreateTags", "ec2:DescribeVpcs",
+                 "ec2:DescribeNetworkInterfaces"],
+      "Resource": "*" }
   ]
 }
 POLICY
@@ -100,7 +112,9 @@ omctl build -f spec-operator.yaml --spec-type ServicePlanSpec \
   --product-name "ScyllaDB" --environment Dev --environment-type dev --release-as-preferred
 ```
 
-The plan names come from the specs' `name:` field: `s3-bucket` and
+Build from the skill folder: both specs name their Terraform modules by
+`artifactsLocalPath` (`terraform`, `terraform-nlb-sg`) relative to the current
+directory. The plan names come from the specs' `name:` field: `s3-bucket` and
 `ScyllaDB AWS` (the GCP skill builds `ScyllaDB GCP` into the same product).
 
 ### 4. Create the backup bucket
@@ -222,8 +236,12 @@ agent sidecar (200m / 512Mi) and the node's daemonsets:
 Production mode (`developerMode: false`) works on Omnistrate's NVMe array —
 Scylla runs `iotune` on first boot (~1 min).
 
-**Placement.** Members are pinned to the instance's node pool
-(`omnistrate.com/resource`, instance type, region). Omnistrate put all nodes of
+**Placement.** Members are pinned to this plan's `scylladb` node pool by the
+node labels `omnistrate.com/resource-alias: scylladb` and
+`omnistrate.com/product-tier-id` (plus instance type and region). Not by
+`omnistrate.com/resource`: a restore target renders `$sys.deployment.resourceID`
+as another resource's ID (here `nlbSecurityGroup`'s), and its members would
+never schedule. Omnistrate put all nodes of
 a pool in **one AZ** in testing, so the cluster survives node loss, not AZ
 loss. ScyllaDB warns that a keyspace with RF 3 on one rack is not
 "RF-rack-valid"; that is advisory.
@@ -231,35 +249,54 @@ loss. ScyllaDB warns that a keyspace with RF 3 on one rack is not
 ### 7. Connect
 
 ```bash
-omctl instance list-endpoints <id>
-cqlsh cqllb.<id>.<cell>.<region>.aws.<domain> 9042 -u admin -p '<password>'
+omctl instance list-endpoints <id>      # → cql: r-<resource>.<id>.<cell>.<region>.aws.<domain> :9042, :19042
+cqlsh r-<resource>.<id>.<cell>.<region>.aws.<domain> 9042 -u admin -p '<password>'
 ```
 
-The CQL load balancer points at a socat proxy in front of the cluster's client
-Service. Topology-aware drivers learn the members' private addresses and can't
-reach them from outside the VPC: configure the driver to use only the contact
-point (e.g. a whitelist/"single host" load-balancing policy), or connect from
-inside the VPC.
+Every member has its **own internet-facing NLB** (the operator's
+`exposeOptions`) and advertises that load balancer's address to clients, so
+token- and shard-aware drivers work from anywhere: give the driver the
+endpoint above as contact point and it discovers every member (tested with the
+Python `scylla-driver` from outside AWS: all members found, requests
+coordinated by the token owners). Members talk to each other on private pod
+IPs. Each member also gets a stable name, `node-<n>.<id>.<cell>.<region>.aws.<domain>`
+— use a few of them as extra contact points.
+
+- **Only CQL (9042, 19042) and the Manager agent (10001) are reachable.** The
+  operator's member Service carries every ScyllaDB port and the NLB gets a
+  listener for each; the `nlbSecurityGroup` security group and the nodes'
+  security group (`network.ports`) admit only those three. 10001 has to be
+  reachable because the operator's own cleanup Jobs call each member through
+  its public address; the agent serves only HTTPS and rejects requests
+  without the cluster's random token (verified: 401).
+- **Client IPs are not preserved** (the operator's in-cell calls couldn't
+  hairpin through the NLB otherwise), so ScyllaDB sees the NLB's address.
+- The NLBs balance **cross-zone**, because ScyllaDB advertises one of each
+  NLB's per-AZ addresses, and members may live in any AZ.
+- A stop/start re-creates the load balancers: members get new addresses, the
+  names follow (60 s TTL).
 
 ## Day-2 operations
 
 `$I` is the ScyllaDB instance ID. After any change, wait for
 `omctl instance describe $I --deployment-status | jq -r .status` → `RUNNING`.
 
-All rows were exercised against a live 3-member cluster (`i4i.large` →
-`i4i.xlarge`, a 3-row RF-3 test table read back at `CONSISTENCY ALL` after
-every step). Times are for that small data set; data-moving operations
+All rows were exercised against live 3-member clusters (`i4i.large` →
+`i4i.xlarge`) with an RF-3 test table read back at `CONSISTENCY ALL` after every
+step — with the per-member load balancers, from outside AWS through the
+published endpoint with the Python `scylla-driver`, which found and used every
+member each time. Times are for that small data set; data-moving operations
 (restore, start, member/VM replace, instance-type change) scale with data size.
 
 | Operation | Command | Tested |
 |---|---|---|
 | Backup | `omctl instance trigger-backup $I` | ✅ ~40 s |
-| Restore (new instance) | `omctl instance restore $I --snapshot-id <snap>` | ✅ ~12 min incl. new nodes |
-| Add members (3 → 4) | `omctl instance modify $I --param '{"memberCount":"4"}'` | ✅ ~10 min |
+| Restore (new instance) | `omctl instance restore $I --snapshot-id <snap>` | ✅ ~12 min incl. new nodes (see below: may end `FAILED` although it worked) |
+| Add members (3 → 4) | `omctl instance modify $I --param '{"memberCount":"4"}'` | ✅ ~6.5 min, new member gets its own NLB and `node-3` name |
 | Remove members (4 → 3) | `omctl instance modify $I --param '{"memberCount":"3"}'` | ✅ ~3 min |
 | Change instance type | `omctl instance modify $I --param '{"awsInstanceType":"i4i.xlarge","cpuQuantity":"3","memoryQuantity":"24Gi"}'` | ✅ ~25 min for 3 members |
 | Stop | `omctl instance stop $I` | ✅ ~1.5 min; NVMe nodes gone ~4 min later |
-| Start | `omctl instance start $I` | ✅ ~5 min |
+| Start | `omctl instance start $I` | ✅ ~7 min; new NLBs, names follow |
 | Rolling restart | `omctl instance restart $I` | ✅ ~4 min (pod by pod) |
 | Replace a member | `omctl instance operation trigger $I replaceMember --param '{"member":"<id>-dc1-rack1-2"}' -y` | ✅ ~3.5 min |
 | Replace a member's VM | `omctl instance operation trigger $I replaceMemberVM --param '{"member":"<id>-dc1-rack1-1"}' -y` | ✅ ~6.5 min; old VM removed by the autoscaler |
@@ -289,6 +326,19 @@ A restore always creates a **new** instance with the source's parameters: it
 creates an empty cluster, the CQL superuser, then runs Manager restore
 `--restore-schema` and `--restore-tables` for that tag. The data center is
 always named `dc1`, so any snapshot restores into any instance.
+
+- **The target is created from the plan version the snapshot was taken on**,
+  not the source's current version. A snapshot from a version with a bug in
+  its restore workflow keeps that bug; take a fresh snapshot after upgrading.
+- **The target may end `FAILED` although the restore succeeded**
+  (`scylladb workflow failed. Reason: child workflow execution already
+  started` — the platform re-starts the workflow it is already running).
+  Check the data and the endpoint, then run any `modify` (e.g. the same
+  `memberCount`) to bring the instance to `RUNNING`.
+- The target's workflow inputs are rendered before its endpoint exists, so the
+  ops Job derives the contact-point name itself
+  (`r-<resource>.<instance>.<cell zone>`, the zone read from the cell's
+  external-dns, through a Role in `external-dns-ns` that delete removes).
 
 ### Add or remove members
 
@@ -347,7 +397,7 @@ Both need `memberCount` ≥ 2 and RF ≥ 2.
 ### Delete
 
 ```bash
-omctl instance delete $I --yes     # deletes the ScyllaCluster, its Secrets/ConfigMaps and ops RBAC
+omctl instance delete $I --yes     # deletes the ScyllaCluster (and so its load balancers), its Secrets/ConfigMaps, ops RBAC and the security group
 ```
 
 Backups stay in the bucket. Deleting the **bucket** instance deletes every
@@ -371,8 +421,9 @@ backup in it (`force_destroy = true`).
 - **Workflow finalization lags.** Backup, restart and restore workflows show
   every step `success` but stay `RUNNING` for ~10–15 min; the instance is
   locked (`conflicting operation is already in progress`) until then.
-- **Drivers behind the load balancer** must not follow the cluster topology
-  (members' addresses are private).
+- **One NLB per member**, each billed by AWS (hourly + LCU).
+- **The network setup is fixed at create** (`exposeOptions` and the load
+  balancer class are immutable).
 
 ## Parameters (`scylladb` resource)
 
@@ -416,6 +467,11 @@ copies identical when you change it. Validate with
 | Extra NVMe nodes appear during create/scale | Operator cleanup Jobs inherit the rack placement; the spec's `matchLabelKeys` anti-affinity keeps them on the members' nodes — if you edit placement, keep it |
 | auth Job fails `cannot log in` | Password with characters outside the regex, or the maintenance socket is disabled |
 | Backup Job fails `cluster is not registered with Scylla Manager` | `scylla-manager` amenity missing or unhealthy (`kubectl -n scylla-manager get pods`) |
+| ScyllaCluster `Degraded`: `spec.loadBalancerClass: Invalid value: null: may not change once set` | The AWS Load Balancer Controller sets `service.k8s.aws/nlb`; `exposeOptions.nodeService.loadBalancerClass` must declare the same value (the spec does). Immutable: re-create the instance |
+| Operator `cleanup-…` Jobs fail `Post "https://magic.host/compaction_manager/…": timeout`, instance stuck in create | They call each member's agent (10001) through its load balancer: 10001 must be open in both `network.ports` and the `nlbSecurityGroup` group, and client-IP preservation off. Failed cleanup Jobs are not retried — delete them and the operator re-creates them |
+| Restore target members `Pending`: `didn't match Pod's node affinity` | Placement pinned by `omnistrate.com/resource` — in a restore that renders another resource's ID. Pin by `resource-alias` + `product-tier-id` (the spec does) |
+| Restore fails at once: `unresolved workflow input parameters: [$sys.compute.node.instanceType $sys.network.externalClusterEndpoint]` | Neither renders for a restore target; the spec uses `$var.awsInstanceType` and derives the endpoint name. If you still see it, the snapshot is from an older plan version — take a new one |
+| Nothing but 9042 answers on a member address from outside | Expected for 7000/7001/7199/9180/10000; 19042 and 10001 must answer (`nc -z <node-n name> 19042`) |
 | `kubectl`: `You must be logged in to the server` | The kubeconfig token expired (~1 h). Run `update-kubeconfig` again |
 
 Debug a workflow and its Jobs:

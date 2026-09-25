@@ -12,16 +12,6 @@ features:
     logs:
   CUSTOMER:
     logs:
-loadBalancers:
-  https: []
-  tcp:
-    - name: cql
-      description: TCP ingress for CQL (port 9042).
-      ports:
-        - associatedResourceKeys:
-            - cqlProxy
-          ingressPort: 9042
-          backendPort: 9042
 services:
   - name: scylladb
     description: ScyllaDB cluster on local NVMe, managed by the ScyllaDB Operator.
@@ -39,6 +29,8 @@ services:
     network:
       ports:
         - 9042
+        - 19042
+        - 10001
     apiParameters:
       - key: awsInstanceType
         name: Instance Type
@@ -105,9 +97,9 @@ services:
         regex: ^[1-9][0-9]*(Mi|Gi)$
       - key: storageGiB
         name: Storage GiB (advisory)
-        description: 'Local NVMe volume request per member. Advisory: each member can use the whole local array of its node.'
+        description: 'Local NVMe volume request per member. Advisory: each member can use the whole local array of its node. To get more storage, change the instance type.'
         type: String
-        modifiable: true
+        modifiable: false
         required: false
         export: true
         defaultValue: '500'
@@ -541,15 +533,17 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.awsInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
+              - name: lbSecurityGroupId
+                value: "{{ $nlbSecurityGroup.out.securityGroupId }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupS3BucketName
                 value: "{{ $var.backupS3BucketName }}"
               - name: backupS3BucketRegion
@@ -572,10 +566,11 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupS3BucketName
                   - name: backupS3BucketRegion
                   - name: backupS3AccessKeyId
@@ -612,8 +607,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupS3BucketName
                           value: "{{inputs.parameters.backupS3BucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -676,6 +671,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster
                     dependencies:
@@ -703,8 +717,10 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
+                        - name: lbSecurityGroupId
+                          value: "{{inputs.parameters.lbSecurityGroupId}}"
                   - name: deleteauthjob
                     template: delete-job
                     dependencies:
@@ -713,6 +729,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -772,7 +789,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupS3BucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -788,7 +805,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "s3:{{inputs.parameters.backupS3BucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -969,28 +986,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -1382,6 +1405,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster
               inputs:
                 parameters:
@@ -1395,7 +1465,8 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
               resource:
                 action: apply
                 successCondition: "status.members == {{inputs.parameters.memberCount}}, status.readyMembers == {{inputs.parameters.memberCount}}, status.availableMembers == {{inputs.parameters.memberCount}}"
@@ -1418,6 +1489,27 @@ services:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          service.beta.kubernetes.io/aws-load-balancer-security-groups: "{{inputs.parameters.lbSecurityGroupId}}"
+                          service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+                          service.beta.kubernetes.io/aws-load-balancer-type: external
+                          service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+                          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                          service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=false
+                          service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: 'false'
+                          service.beta.kubernetes.io/aws-load-balancer-target-node-labels: omnistrate.com/managed-by=omnistrate
+                          service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "omnistrate.com/managed-by=omnistrate,omnistrate.com/instance-id={{inputs.parameters.instanceId}}"
+                          service.beta.kubernetes.io/load-balancer-source-ranges: 0.0.0.0/0
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        loadBalancerClass: service.k8s.aws/nlb
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -1459,10 +1551,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -1606,15 +1702,17 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.awsInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
+              - name: lbSecurityGroupId
+                value: "{{ $nlbSecurityGroup.out.securityGroupId }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupS3BucketName
                 value: "{{ $var.backupS3BucketName }}"
               - name: backupS3BucketRegion
@@ -1637,10 +1735,11 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupS3BucketName
                   - name: backupS3BucketRegion
                   - name: backupS3AccessKeyId
@@ -1677,8 +1776,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupS3BucketName
                           value: "{{inputs.parameters.backupS3BucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -1741,6 +1840,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster-async
                     dependencies:
@@ -1768,8 +1886,10 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
+                        - name: lbSecurityGroupId
+                          value: "{{inputs.parameters.lbSecurityGroupId}}"
                   - name: deletereconcile
                     template: delete-job
                     dependencies:
@@ -1778,6 +1898,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -1837,7 +1958,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupS3BucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -1853,7 +1974,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "s3:{{inputs.parameters.backupS3BucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -2034,28 +2155,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -2447,6 +2574,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster-async
               inputs:
                 parameters:
@@ -2460,7 +2634,8 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
               resource:
                 action: apply
                 manifest: |
@@ -2482,6 +2657,27 @@ services:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          service.beta.kubernetes.io/aws-load-balancer-security-groups: "{{inputs.parameters.lbSecurityGroupId}}"
+                          service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+                          service.beta.kubernetes.io/aws-load-balancer-type: external
+                          service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+                          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                          service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=false
+                          service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: 'false'
+                          service.beta.kubernetes.io/aws-load-balancer-target-node-labels: omnistrate.com/managed-by=omnistrate
+                          service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "omnistrate.com/managed-by=omnistrate,omnistrate.com/instance-id={{inputs.parameters.instanceId}}"
+                          service.beta.kubernetes.io/load-balancer-source-ranges: 0.0.0.0/0
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        loadBalancerClass: service.k8s.aws/nlb
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -2523,10 +2719,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -2671,15 +2871,17 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.awsInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
+              - name: lbSecurityGroupId
+                value: "{{ $nlbSecurityGroup.out.securityGroupId }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupS3BucketName
                 value: "{{ $var.backupS3BucketName }}"
               - name: backupS3BucketRegion
@@ -2702,10 +2904,11 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupS3BucketName
                   - name: backupS3BucketRegion
                   - name: backupS3AccessKeyId
@@ -2742,8 +2945,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupS3BucketName
                           value: "{{inputs.parameters.backupS3BucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -2806,6 +3009,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster
                     dependencies:
@@ -2833,8 +3055,10 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
+                        - name: lbSecurityGroupId
+                          value: "{{inputs.parameters.lbSecurityGroupId}}"
                   - name: deleteauthjob
                     template: delete-job
                     dependencies:
@@ -2843,6 +3067,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -2930,7 +3155,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupS3BucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -2946,7 +3171,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "s3:{{inputs.parameters.backupS3BucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -3127,28 +3352,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -3540,6 +3771,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster
               inputs:
                 parameters:
@@ -3553,7 +3831,8 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
               resource:
                 action: apply
                 successCondition: "status.members == {{inputs.parameters.memberCount}}, status.readyMembers == {{inputs.parameters.memberCount}}, status.availableMembers == {{inputs.parameters.memberCount}}"
@@ -3576,6 +3855,27 @@ services:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          service.beta.kubernetes.io/aws-load-balancer-security-groups: "{{inputs.parameters.lbSecurityGroupId}}"
+                          service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+                          service.beta.kubernetes.io/aws-load-balancer-type: external
+                          service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+                          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                          service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=false
+                          service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: 'false'
+                          service.beta.kubernetes.io/aws-load-balancer-target-node-labels: omnistrate.com/managed-by=omnistrate
+                          service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "omnistrate.com/managed-by=omnistrate,omnistrate.com/instance-id={{inputs.parameters.instanceId}}"
+                          service.beta.kubernetes.io/load-balancer-source-ranges: 0.0.0.0/0
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        loadBalancerClass: service.k8s.aws/nlb
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -3617,10 +3917,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -4159,6 +4463,26 @@ services:
                       parameters:
                         - name: name
                           value: "{{inputs.parameters.instanceId}}-ops"
+                  - name: deleteopsdnsrolebinding
+                    template: delete-rolebinding
+                    dependencies:
+                      - deletecluster
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: external-dns-ns
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-ops-dns"
+                  - name: deleteopsdnsrole
+                    template: delete-role
+                    dependencies:
+                      - deleteopsdnsrolebinding
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: external-dns-ns
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: delete-cluster
               inputs:
                 parameters:
@@ -4647,15 +4971,17 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.awsInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
+              - name: lbSecurityGroupId
+                value: "{{ $nlbSecurityGroup.out.securityGroupId }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: ''
               - name: backupS3BucketName
                 value: "{{ $var.backupS3BucketName }}"
               - name: backupS3BucketRegion
@@ -4680,10 +5006,11 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupS3BucketName
                   - name: backupS3BucketRegion
                   - name: backupS3AccessKeyId
@@ -4721,8 +5048,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupS3BucketName
                           value: "{{inputs.parameters.backupS3BucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -4785,6 +5112,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster
                     dependencies:
@@ -4812,8 +5158,10 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
+                        - name: lbSecurityGroupId
+                          value: "{{inputs.parameters.lbSecurityGroupId}}"
                   - name: deleteauthjob
                     template: delete-job
                     dependencies:
@@ -4822,6 +5170,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -4909,7 +5258,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupS3BucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -4925,7 +5274,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "s3:{{inputs.parameters.backupS3BucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -5106,28 +5455,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -5519,6 +5874,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster
               inputs:
                 parameters:
@@ -5532,7 +5934,8 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
+                  - name: lbSecurityGroupId
               resource:
                 action: apply
                 successCondition: "status.members == {{inputs.parameters.memberCount}}, status.readyMembers == {{inputs.parameters.memberCount}}, status.availableMembers == {{inputs.parameters.memberCount}}"
@@ -5555,6 +5958,27 @@ services:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          service.beta.kubernetes.io/aws-load-balancer-security-groups: "{{inputs.parameters.lbSecurityGroupId}}"
+                          service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+                          service.beta.kubernetes.io/aws-load-balancer-type: external
+                          service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+                          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+                          service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=false
+                          service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules: 'false'
+                          service.beta.kubernetes.io/aws-load-balancer-target-node-labels: omnistrate.com/managed-by=omnistrate
+                          service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: "omnistrate.com/managed-by=omnistrate,omnistrate.com/instance-id={{inputs.parameters.instanceId}}"
+                          service.beta.kubernetes.io/load-balancer-source-ranges: 0.0.0.0/0
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        loadBalancerClass: service.k8s.aws/nlb
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -5596,10 +6020,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -5718,25 +6146,28 @@ services:
                           - name: scripts
                             configMap:
                               name: "{{inputs.parameters.instanceId}}-ops-scripts"
+    endpointConfiguration:
+      cql:
+        host: $sys.network.externalClusterEndpoint
+        ports:
+          - 9042
+          - 19042
+        primary: true
+        networkingType: PUBLIC
     dependsOn:
-      - cqlProxy
-  - name: cqlProxy
-    description: Internal TCP proxy from the CQL load balancer to the ScyllaDB client Service.
+      - nlbSecurityGroup
+  - name: nlbSecurityGroup
+    description: 'Front-end security group for the CQL load balancers: 9042/19042 only.'
     internal: true
-    image: docker.io/alpine/socat:1.8.0.0
-    command:
-      - /bin/sh
-      - -ec
-    args:
-      - |
-        ID="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-        exec socat TCP-LISTEN:9042,fork,reuseaddr TCP:"${ID}-client:9042",connect-timeout=5
-    compute:
-      replicaCount: 1
-      rootVolumeSizeGi: 20
-      instanceTypes:
-        - name: t4g.small
-          cloudProvider: aws
-    network:
-      ports:
-        - 9042
+    terraformConfigurations:
+      configurationPerCloudProvider:
+        aws:
+          terraformPath: /
+          artifactsLocalPath: terraform-nlb-sg
+          variablesValuesFileOverride: |
+            region  = "{{ $sys.deploymentCell.region }}"
+            vpcId   = "{{ $sys.deploymentCell.cloudProviderNetworkID }}"
+            vpcCidr = "{{ $sys.deploymentCell.cidrRange }}"
+          requiredOutputs:
+            - key: securityGroupId
+              exported: false

@@ -89,9 +89,9 @@ services:
         regex: ^[1-9][0-9]*(Mi|Gi)$
       - key: storageGiB
         name: Storage GiB (advisory)
-        description: 'Local NVMe volume request per member. Advisory: each member can use the whole local array of its node.'
+        description: 'Local NVMe volume request per member. Advisory: each member can use the whole local array of its node. To get more storage, change the instance type.'
         type: String
-        modifiable: true
+        modifiable: false
         required: false
         export: true
         defaultValue: '500'
@@ -511,15 +511,15 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.gcpInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupGcsBucketName
                 value: "{{ $var.backupGcsBucketName }}"
               - name: backupGcsCredentials
@@ -538,10 +538,10 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
               dag:
@@ -582,8 +582,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -674,8 +674,8 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
                   - name: deleteauthjob
                     template: delete-job
                     dependencies:
@@ -757,7 +757,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupGcsBucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -773,7 +773,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -954,28 +954,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -1380,7 +1386,7 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
               resource:
                 action: apply
                 successCondition: "status.members == {{inputs.parameters.memberCount}}, status.readyMembers == {{inputs.parameters.memberCount}}, status.availableMembers == {{inputs.parameters.memberCount}}"
@@ -1444,10 +1450,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -1599,15 +1609,15 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.gcpInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupGcsBucketName
                 value: "{{ $var.backupGcsBucketName }}"
               - name: backupGcsCredentials
@@ -1626,10 +1636,10 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
               dag:
@@ -1670,8 +1680,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -1762,8 +1772,8 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
                   - name: deletereconcile
                     template: delete-job
                     dependencies:
@@ -1845,7 +1855,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupGcsBucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -1861,7 +1871,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -2042,28 +2052,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -2468,7 +2484,7 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
               resource:
                 action: apply
                 manifest: |
@@ -2531,10 +2547,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -2687,15 +2707,15 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.gcpInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupGcsBucketName
                 value: "{{ $var.backupGcsBucketName }}"
               - name: backupGcsCredentials
@@ -2714,10 +2734,10 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
               dag:
@@ -2758,8 +2778,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -2850,8 +2870,8 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
                   - name: deleteauthjob
                     template: delete-job
                     dependencies:
@@ -2961,7 +2981,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupGcsBucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -2977,7 +2997,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -3158,28 +3178,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -3584,7 +3610,7 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
               resource:
                 action: apply
                 successCondition: "status.members == {{inputs.parameters.memberCount}}, status.readyMembers == {{inputs.parameters.memberCount}}, status.availableMembers == {{inputs.parameters.memberCount}}"
@@ -3648,10 +3674,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
@@ -4696,15 +4726,15 @@ services:
               - name: region
                 value: "{{ $sys.deploymentCell.region }}"
               - name: instanceType
-                value: "{{ $sys.compute.node.instanceType }}"
-              - name: resourceId
-                value: "{{ $sys.deployment.resourceID }}"
+                value: "{{ $var.gcpInstanceType }}"
+              - name: planId
+                value: "{{ $func.tolower($sys.deployment.planID) }}"
               - name: adminUsername
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
-              - name: domainSuffix
-                value: "{{ $sys.network.domainSuffix }}"
+              - name: contactHost
+                value: ''
               - name: backupGcsBucketName
                 value: "{{ $var.backupGcsBucketName }}"
               - name: backupGcsCredentials
@@ -4725,10 +4755,10 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
                   - name: adminUsername
                   - name: adminPassword
-                  - name: domainSuffix
+                  - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
                   - name: snapshotTag
@@ -4770,8 +4800,8 @@ services:
                           value: "{{inputs.parameters.adminPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
-                        - name: domainSuffix
-                          value: "{{inputs.parameters.domainSuffix}}"
+                        - name: contactHost
+                          value: "{{inputs.parameters.contactHost}}"
                   - name: scyllaconfig
                     template: apply-scylla-config
                     arguments:
@@ -4862,8 +4892,8 @@ services:
                           value: "{{inputs.parameters.region}}"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
-                        - name: resourceId
-                          value: "{{inputs.parameters.resourceId}}"
+                        - name: planId
+                          value: "{{inputs.parameters.planId}}"
                   - name: deleteauthjob
                     template: delete-job
                     dependencies:
@@ -4973,7 +5003,7 @@ services:
                   - name: adminUsername
                   - name: adminPassword
                   - name: backupGcsBucketName
-                  - name: domainSuffix
+                  - name: contactHost
               resource:
                 action: apply
                 manifest: |
@@ -4989,7 +5019,7 @@ services:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
-                    DOMAIN_SUFFIX: "{{inputs.parameters.domainSuffix}}"
+                    CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
               inputs:
                 parameters:
@@ -5170,28 +5200,34 @@ services:
                       }
 
                       # Each member has its own load balancer (spec.exposeOptions); name them in the
-                      # instance's DNS zone through the cell's external-dns: node-<n>.<zone> for every
-                      # member, plus cql.<zone> (the published contact point) on member 0. The
-                      # operator gives all member Services the same annotations, so this is per member.
-                      dns_zone() {
-                        case "${DOMAIN_SUFFIX:-}" in
-                          "") echo "" ;;
-                          "$CLUSTER".*) echo "$DOMAIN_SUFFIX" ;;
-                          *) echo "$CLUSTER.$DOMAIN_SUFFIX" ;;
-                        esac
-                      }
-
+                      # instance's DNS zone through the cell's external-dns. CONTACT_HOST is the
+                      # instance's Omnistrate endpoint name (<label>.<instance zone>, published as
+                      # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
+                      # member. The operator gives all member Services the same annotations, so this
+                      # is done per member.
                       sync_dns() {
                         [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
-                        zone=$(dns_zone)
-                        [ -n "$zone" ] || { log "warning: no DNS suffix; member load balancers keep only their cloud names"; return 0; }
+                        if [ -z "${CONTACT_HOST:-}" ]; then
+                          # restore targets get no endpoint name at render time; build Omnistrate's
+                          # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
+                          cell_zone=$(kubectl -n external-dns-ns get deploy external-dns -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null |
+                            grep -o -- '--domain-filter=[^",]*' | head -1 | cut -d= -f2)
+                          # the resource ID from the node label (a restore target renders the resource ID of another resource)
+                          n0=$(k get pod "$(members | head -1)" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                          rid=$(kubectl get node "$n0" -o jsonpath='{.metadata.labels.omnistrate\.com/resource}' 2>/dev/null || true)
+                          [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
+                        fi
+                        case "${CONTACT_HOST:-}" in
+                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
+                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                        esac
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
-                          [ "$n" != 0 ] || h="$h,cql.$zone"
+                          [ "$n" != 0 ] || h="$CONTACT_HOST,$h"
                           k annotate svc "$p" "external-dns.alpha.kubernetes.io/hostname=$h" --overwrite >/dev/null
                         done
-                        log "DNS: cql.$zone and node-<n>.$zone for $(members | grep -c .) members"
+                        log "DNS: $CONTACT_HOST and node-<n>.$zone for $(members | grep -c .) members"
                       }
 
                       # --- operations ---------------------------------------------------------------
@@ -5596,7 +5632,7 @@ services:
                   - name: developerMode
                   - name: region
                   - name: instanceType
-                  - name: resourceId
+                  - name: planId
               resource:
                 action: apply
                 successCondition: "status.members == {{inputs.parameters.memberCount}}, status.readyMembers == {{inputs.parameters.memberCount}}, status.availableMembers == {{inputs.parameters.memberCount}}"
@@ -5660,10 +5696,14 @@ services:
                                         operator: In
                                         values:
                                           - "{{inputs.parameters.instanceType}}"
-                                      - key: omnistrate.com/resource
+                                      - key: omnistrate.com/resource-alias
                                         operator: In
                                         values:
-                                          - "{{inputs.parameters.resourceId}}"
+                                          - scylladb
+                                      - key: omnistrate.com/product-tier-id
+                                        operator: In
+                                        values:
+                                          - "{{inputs.parameters.planId}}"
                             podAntiAffinity:
                               requiredDuringSchedulingIgnoredDuringExecution:
                                 - labelSelector:
