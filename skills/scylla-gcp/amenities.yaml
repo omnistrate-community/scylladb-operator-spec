@@ -1,0 +1,189 @@
+# Deployment-cell config for ScyllaDB on GKE. update-config-template REPLACES
+# the cell's whole config: merge the customAmenities below into the cell's
+# current template (omctl deployment-cell describe-config-template --id <cell>)
+# instead of applying this file as-is to a cell that already has custom amenities.
+managedAmenities:
+  - name: Observability Prometheus
+    description: Observability Prometheus
+    type: Helm
+  - name: External DNS
+    description: External DNS
+    type: Helm
+  - name: Cert Manager
+    description: Cert Manager
+    type: Helm
+  - name: Nginx Ingress Controller
+    description: Nginx Ingress Controller
+    type: Helm
+  - name: Cost Insight Prometheus
+    description: Cost Insight Prometheus
+    type: Helm
+  - name: NVIDIA DCGM Exporter
+    description: NVIDIA DCGM Exporter
+    type: Helm
+  - name: Kubernetes Dashboard
+    description: Kubernetes Dashboard
+    type: Helm
+
+customAmenities:
+  # Cluster-scoped operator + CRDs, once per cell, on the cell's system nodes.
+  # The webhook certificate is issued by the managed Cert Manager amenity.
+  - name: scylla-operator
+    description: ScyllaDB Operator installed once per deployment cell for ScyllaDB clusters.
+    type: Helm
+    dependsOn:
+      - Cert Manager
+    properties:
+      ChartName: scylla-operator
+      ChartVersion: v1.22.0
+      ChartRepoName: scylla-operator
+      ChartRepoURL: https://scylla-operator-charts.storage.googleapis.com/stable
+      DefaultNamespace: scylla-operator
+      ReleaseName: scylla-operator
+      ChartValues:
+        replicas: 1
+        webhookServerReplicas: 2
+        webhook:
+          createSelfSignedCertificate: true
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: omnistrate.com/control-plane
+                      operator: Exists
+        tolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
+            effect: NoSchedule
+          - key: components.gke.io/gke-managed-components
+            operator: Exists
+            effect: NoSchedule
+        webhookServerAffinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: omnistrate.com/control-plane
+                      operator: Exists
+        webhookServerTolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
+            effect: NoSchedule
+          - key: components.gke.io/gke-managed-components
+            operator: Exists
+            effect: NoSchedule
+  # Scylla Manager (the backup/restore engine) plus its own 1-node ScyllaDB
+  # metadata store on a pd-balanced disk, also on system nodes. The operator
+  # auto-registers every ScyllaCluster in the cell with this Manager.
+  - name: scylla-manager
+    description: ScyllaDB Manager installed once per deployment cell for ScyllaDB backups and restores.
+    type: Helm
+    dependsOn:
+      - scylla-operator
+    properties:
+      ChartName: scylla-manager
+      ChartVersion: v1.22.0
+      ChartRepoName: scylla-operator
+      ChartRepoURL: https://scylla-operator-charts.storage.googleapis.com/stable
+      DefaultNamespace: scylla-manager
+      ReleaseName: scylla-manager
+      ChartValues:
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: omnistrate.com/control-plane
+                      operator: Exists
+        tolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
+            effect: NoSchedule
+          - key: components.gke.io/gke-managed-components
+            operator: Exists
+            effect: NoSchedule
+        scylla:
+          developerMode: true
+          datacenter: manager-dc
+          racks:
+            - name: manager-rack
+              members: 1
+              storage:
+                storageClassName: pd-balanced
+                capacity: 10Gi
+              resources:
+                requests:
+                  cpu: 1
+                  memory: 1Gi
+                limits:
+                  cpu: 1
+                  memory: 1Gi
+              placement:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: omnistrate.com/control-plane
+                            operator: Exists
+                tolerations:
+                  - key: CriticalAddonsOnly
+                    operator: Exists
+                    effect: NoSchedule
+                  - key: components.gke.io/gke-managed-components
+                    operator: Exists
+                    effect: NoSchedule
+  # Tiny CRD whose status carries a backup's snapshot tag back to Omnistrate:
+  # workflow outputParameters can only read a resource's status, and a Job's
+  # status has no room for custom values. Cluster-scoped, so installed per cell.
+  - name: scylla-snapshot-crd
+    description: ScyllaSnapshot CRD recording Scylla Manager snapshot tags for Omnistrate snapshots.
+    type: KubernetesManifest
+    properties:
+      manifests:
+        - def:
+            apiVersion: apiextensions.k8s.io/v1
+            kind: CustomResourceDefinition
+            metadata:
+              name: scyllasnapshots.scylla.omnistrate.io
+            spec:
+              group: scylla.omnistrate.io
+              scope: Namespaced
+              names:
+                kind: ScyllaSnapshot
+                listKind: ScyllaSnapshotList
+                plural: scyllasnapshots
+                singular: scyllasnapshot
+              versions:
+                - name: v1
+                  served: true
+                  storage: true
+                  subresources:
+                    status: {}
+                  additionalPrinterColumns:
+                    - name: Tag
+                      type: string
+                      jsonPath: .status.snapshotTag
+                    - name: Location
+                      type: string
+                      jsonPath: .status.location
+                  schema:
+                    openAPIV3Schema:
+                      type: object
+                      properties:
+                        spec:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                        status:
+                          type: object
+                          properties:
+                            ready:
+                              type: boolean
+                            snapshotTag:
+                              type: string
+                            location:
+                              type: string

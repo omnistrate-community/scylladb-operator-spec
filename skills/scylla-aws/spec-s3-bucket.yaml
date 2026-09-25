@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://api.omnistrate.cloud/2022-09-01-00/schema/service-spec-schema.json
+# S3 backup bucket for ScyllaDB on AWS. One instance = one bucket plus an IAM
+# user/access key scoped to it. Pass its outputs into the ScyllaDB instance as
+# the backupS3* parameters (see SKILL.md).
+#
+# Hosted Terraform can't attach custom policies: grant the
+# omnistrate-terraform-execution-role in your AWS account S3 and IAM user/key
+# permissions directly (SKILL.md, step 1).
+#
+# Build from this directory: artifactsLocalPath is relative to the working dir.
+name: s3-bucket
+tenancyType: CUSTOM_TENANCY
+deployment:
+  hostedDeployment:
+    awsAccountId: "<AWS_ACCOUNT_ID>"
+    awsBootstrapRoleAccountArn: "arn:aws:iam::<AWS_ACCOUNT_ID>:role/omnistrate-bootstrap-role"
+
+services:
+  - name: s3backup
+    description: S3 backup bucket + scoped IAM user for ScyllaDB Manager backups.
+    apiParameters:
+      - key: bucketRegion
+        name: Bucket Region
+        description: AWS region the backup bucket is created in. Use the ScyllaDB region.
+        type: String
+        modifiable: false
+        required: false
+        export: true
+        defaultValue: us-east-1
+    terraformConfigurations:
+      configurationPerCloudProvider:
+        aws:
+          terraformPath: /
+          artifactsLocalPath: terraform
+          variablesValuesFileOverride: |
+            bucketRegion = "{{ $var.bucketRegion }}"
+          requiredOutputs:
+            - { key: bucketName, exported: true }
+            - { key: bucketRegion, exported: true }
+            - { key: accessKeyId, exported: true }
+            - { key: secretAccessKey, exported: true }

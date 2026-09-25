@@ -1,0 +1,13 @@
+# Locally installed agent skills (not part of this repo)
+.claude/
+.agents/
+skills-lock.json
+
+# Local working files
+*.bak
+*.kubeconfig
+*-outputs.json
+scylla-params.json
+cell-current.yaml
+cell-merged.yaml
+.DS_Store

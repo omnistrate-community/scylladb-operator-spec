@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://api.omnistrate.cloud/2022-09-01-00/schema/service-spec-schema.json
+# GCS backup bucket for ScyllaDB on GCP. One instance = one bucket plus a
+# service account (and JSON key) scoped to it. Pass its outputs into the
+# ScyllaDB instance as the backupGcs* parameters (see SKILL.md).
+#
+# Hosted Terraform runs as the omnistrate-tf-<org-id> service account in your
+# project: grant it the roles in SKILL.md, step 1, before deploying.
+#
+# Build from this directory: artifactsLocalPath is relative to the working dir.
+name: gcs-bucket
+tenancyType: CUSTOM_TENANCY
+deployment:
+  hostedDeployment:
+    gcpProjectId: "<GCP_PROJECT_ID>"
+    gcpProjectNumber: "<GCP_PROJECT_NUMBER>"
+    gcpServiceAccountEmail: "<GCP_BOOTSTRAP_SA_EMAIL>"
+
+services:
+  - name: gcsbackup
+    description: GCS backup bucket + scoped service account for ScyllaDB backups.
+    apiParameters:
+      - key: bucketLocation
+        name: Bucket Location
+        description: GCS location for the bucket. Use the ScyllaDB region to avoid egress charges.
+        type: String
+        modifiable: false
+        required: false
+        export: true
+        defaultValue: us-central1
+    terraformConfigurations:
+      configurationPerCloudProvider:
+        gcp:
+          terraformPath: /
+          artifactsLocalPath: terraform
+          variablesValuesFileOverride: |
+            bucketLocation = "{{ $var.bucketLocation }}"
+            projectId      = "{{ $sys.deploymentCell.gcp.projectID }}"
+          requiredOutputs:
+            - { key: bucketName, exported: true }
+            - { key: bucketLocation, exported: true }
+            - { key: credentialsBase64, exported: true }
