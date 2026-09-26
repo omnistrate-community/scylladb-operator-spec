@@ -27,9 +27,10 @@ All commands use `omnistrate-ctl` (alias `omctl`); log in first with
 
 | File | What it is |
 |---|---|
-| `spec-operator.yaml` | ScyllaDB ServicePlanSpec: `ScyllaCluster` on local SSD + CQL load balancer + lifecycle workflows. **Generated** — see "Editing" |
+| `spec-operator.yaml` | ScyllaDB ServicePlanSpec: `ScyllaCluster` on local SSD with one internet-facing load balancer per member, lifecycle workflows, and the `nlbFirewall` Terraform resource. **Generated** — see "Editing" |
 | `spec-gcs-bucket.yaml` | Terraform-backed service that creates one GCS bucket + a service account/key scoped to it |
 | `terraform/main.tf` | The Terraform module used by `spec-gcs-bucket.yaml` |
+| `terraform-nlb-fw/main.tf` | Terraform module of the `nlbFirewall` resource: VPC firewall rules keeping the members' internal ports closed to the internet, one pair per instance |
 | `amenities.yaml` | Deployment-cell config: managed amenities + ScyllaDB Operator, Scylla Manager and the `ScyllaSnapshot` CRD |
 
 How it fits together:
@@ -40,8 +41,12 @@ gcs-bucket instance ──outputs──► bucketName, bucketLocation, credentia
                                         ▼
 ScyllaDB instance ── ScyllaCluster <id>: N members, one per n2 node with 2 local SSDs
    │                   │  Manager agent sidecar ──backups──► gs://<bucket>/backup/...
-   │                   └─ ops Jobs (kubectl + sctool) drive backup/restore/stop/start/replace
-   └── TCP LB cqllb:9042 → cqlProxy (socat) → <id>-client:9042
+   │                   ├─ ops Jobs (kubectl + sctool) drive backup/restore/stop/start/replace
+   │                   └─ one external passthrough LB per member (externalTrafficPolicy: Local)
+   │                        node-<n>.<instance zone> ──► member n   (external-dns)
+   │                        <endpoint> (list-endpoints) ──► member 0   = contact point
+   └── nlbFirewall (Terraform) ── on this plan's nodes: internal ScyllaDB ports allowed
+                                  from the cell's ranges (priority 900), denied from anywhere else (950)
 cell amenities: scylla-operator · scylla-manager (+ its own 1-node Scylla on pd-balanced) · ScyllaSnapshot CRD
 ```
 
@@ -70,7 +75,9 @@ PROJECT=<gcp-project-id>
 ORG_ID=$(omctl deployment-cell describe-config-template --cloud gcp | awk '/^Organization:/{print tolower($2)}')
 TF_SA="omnistrate-tf-${ORG_ID}@${PROJECT}.iam.gserviceaccount.com"
 gcloud iam service-accounts describe "$TF_SA" --project "$PROJECT"   # must exist
-for r in roles/storage.admin roles/iam.serviceAccountAdmin roles/iam.serviceAccountKeyAdmin; do
+# storage + service-account roles: the backup bucket; compute roles: the load balancers' firewall rules
+for r in roles/storage.admin roles/iam.serviceAccountAdmin roles/iam.serviceAccountKeyAdmin \
+         roles/compute.securityAdmin roles/compute.networkViewer; do
   gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$TF_SA" \
     --role="$r" --condition=None --format=none
 done
@@ -80,7 +87,9 @@ gcloud resource-manager org-policies describe iam.disableServiceAccountKeyCreati
 ```
 
 Without this, the bucket deploy fails with
-`omnistrate-tf-…  does not have storage.buckets.create access`.
+`omnistrate-tf-…  does not have storage.buckets.create access`, and the
+ScyllaDB create fails at its `nlbFirewall` resource with
+`Required 'compute.networks.get' permission`.
 
 ### 2. Fill in the account placeholders
 
@@ -244,45 +253,66 @@ loss. ScyllaDB warns that a keyspace with RF 3 on one rack is not
 ### 7. Connect
 
 ```bash
-omctl instance list-endpoints <id>
-cqlsh cqllb.<id>.<cell>.<region>.gcp.<domain> 9042 -u admin -p '<password>'
+omctl instance list-endpoints <id>      # → cql: r-<resource>.<id>.<cell>.<region>.gcp.<domain> :9042, :19042
+cqlsh r-<resource>.<id>.<cell>.<region>.gcp.<domain> 9042 -u admin -p '<password>'
 ```
 
-The CQL load balancer points at a socat proxy in front of the cluster's client
-Service. Topology-aware drivers learn the members' private addresses and can't
-reach them from outside the VPC: configure the driver to use only the contact
-point (e.g. a whitelist/"single host" load-balancing policy), or connect from
-inside the VPC.
+Every member has its **own external passthrough load balancer** (the
+operator's `exposeOptions`, backend-service based: `cloud.google.com/l4-rbs`)
+and advertises that load balancer's address to clients, so token- and
+shard-aware drivers work from anywhere: give the driver the endpoint above as
+contact point and it discovers every member (tested with the Python
+`scylla-driver` from outside GCP: all members found, requests coordinated by
+the token owners). Members talk to each other on private pod IPs. Each member
+also gets a stable name, `node-<n>.<id>.<cell>.<region>.gcp.<domain>` — use a
+few of them as extra contact points.
+
+- **Only CQL (9042, 19042) and the Manager agent (10001) are reachable.** GKE
+  opens every port of a LoadBalancer Service to `0.0.0.0/0` (its `k8s2-*`
+  firewall rules, priority 1000). The `nlbFirewall` rules override them on
+  this plan's nodes (network tag `product-tier-<plan id>-id`): the internal
+  ports stay open to the cell's own ranges and are denied from everywhere
+  else. 10001 stays reachable because the operator's cleanup Jobs call each
+  member's agent through its public address; the agent serves only HTTPS and
+  rejects requests without the cluster's random token.
+- **`externalTrafficPolicy: Local` is what makes the firewall hold.** With
+  `Cluster`, each load balancer also delivers to the cell's system nodes,
+  which don't carry the plan tag, and kube-proxy forwards from there to the
+  member, so internal ports (7000 included) answered from the internet about
+  half the time. With `Local`, GKE's health check keeps each load balancer on
+  the member's own node. Client IPs are preserved as a side effect.
+- A stop/start re-creates the load balancers: members get new addresses, the
+  names follow (60 s TTL).
 
 ## Day-2 operations
 
 `$I` is the ScyllaDB instance ID. After any change, wait for
 `omctl instance describe $I --deployment-status | jq -r .status` → `RUNNING`.
 
-The workflows are identical to `scylla-aws`, where every row was exercised
-against a live cluster (times below are from AWS, small data set). They have
-not run on GCP yet.
+Every row was run on GCP (plan v6.0, 3 × `n2-highmem-4`, 2 M rows × 1 KiB,
+an external client writing at QUORUM throughout). After each operation all
+rows were read back at `ALL` with an unchanged checksum, and every
+client-acknowledged write was present, except in the stop window (see
+"Stop and start").
 
-| Operation | Command | Tested on AWS |
+| Operation | Command | Tested on GCP |
 |---|---|---|
-| Backup | `omctl instance trigger-backup $I` | ✅ ~40 s |
-| Restore (new instance) | `omctl instance restore $I --snapshot-id <snap>` | ✅ ~12 min incl. new nodes |
-| Add members (3 → 4) | `omctl instance modify $I --param '{"memberCount":"4"}'` | ✅ ~10 min |
+| Backup | `omctl instance trigger-backup $I` | ✅ ~70 s (Job) |
+| Restore (new instance) | `omctl instance restore $I --snapshot-id <snap>` | ✅ ~18 min incl. new nodes; exact checksum. The target may end `FAILED` although the restore succeeded (Troubleshooting) |
+| Add members (3 → 4) | `omctl instance modify $I --param '{"memberCount":"4"}'` | ✅ ~11 min |
 | Remove members (4 → 3) | `omctl instance modify $I --param '{"memberCount":"3"}'` | ✅ ~3 min |
-| Change machine type | `omctl instance modify $I --param '{"gcpInstanceType":"n2-highmem-8","cpuQuantity":"7","memoryQuantity":"52Gi"}'` | ✅ ~25 min for 3 members |
-| Stop | `omctl instance stop $I` | ✅ ~1.5 min; NVMe nodes gone ~4 min later |
-| Start | `omctl instance start $I` | ✅ ~5 min |
-| Rolling restart | `omctl instance restart $I` | ✅ ~4 min (pod by pod) |
-| Replace a member | `omctl instance operation trigger $I replaceMember --param '{"member":"<id>-dc1-rack1-2"}' -y` | ✅ ~3.5 min |
-| Replace a member's VM | `omctl instance operation trigger $I replaceMemberVM --param '{"member":"<id>-dc1-rack1-1"}' -y` | ✅ ~6.5 min; old VM removed by the autoscaler |
-| Delete a snapshot | automatic, when a snapshot expires (7 days) | ✅ files removed (see Known limits) |
-| Delete | `omctl instance delete $I --yes` | ✅ namespace, cluster RBAC and local PVs gone |
+| Change machine type | `omctl instance modify $I --param '{"gcpInstanceType":"n2-highmem-8","cpuQuantity":"7","memoryQuantity":"52Gi"}'` | ✅ 4 → 8 → 16 → 4 vCPU, ~35 min per change for 3 members |
+| ScyllaDB version | `omctl instance modify $I --param '{"scyllaVersion":"2026.2.7"}'` | ✅ ~13 min, rolling |
+| Stop | `omctl instance stop $I` | ✅ ~3 min |
+| Start | `omctl instance start $I` | ✅ ~10 min (restore of 2 GB); clients must reconnect |
+| Rolling restart | `omctl instance restart $I` | ✅ ~10 min (pod by pod) |
+| Replace a member | `omctl instance operation trigger $I replaceMember --param '{"member":"<id>-dc1-rack1-1"}' -y` | ✅ ~6.5 min |
+| Replace a member's VM | `omctl instance operation trigger $I replaceMemberVM --param '{"member":"<id>-dc1-rack1-2"}' -y` | ✅ ~11 min; old VM removed by the autoscaler |
+| Delete | `omctl instance delete $I --yes` | ✅ namespace, cluster RBAC, local PVs, load balancers and firewall rules gone |
 
-Member names are `<instance-id>-dc1-rack1-<n>`
-(`kubectl -n $I get pods -l scylla/cluster=$I`). Custom operations (the two
-replaces) run in the background and the instance stays `RUNNING`; follow them
-with `omctl workflow list … -i $I` or the Job's logs
-(`kubectl -n $I logs job/$I-replace -c ops`, `job/$I-replace-vm`).
+Machine types used for `gcpInstanceType` / `cpuQuantity` / `memoryQuantity`:
+`n2-highmem-4` / `3` / `24Gi`, `n2-highmem-8` / `7` / `52Gi`,
+`n2-highmem-16` / `15` / `104Gi` (leave ~1 vCPU and ~8 % of memory for GKE).
 
 ### Backup and restore
 
@@ -322,7 +352,14 @@ The Job detects a stranded member from its PV: the node it is pinned to is
 of the old type, cordoned for scale-down, or gone. This needs `memberCount` ≥ 2
 and keyspaces with RF ≥ 2; a 1-member cluster refuses (take a backup and
 restore into a new instance instead). Nodes of the old type are removed by the
-autoscaler once empty.
+autoscaler once empty. A member left on a healthy node of another type (e.g.
+after an interrupted change) is moved the same way: once every member is
+ready, the Job cordons that node and re-creates the pod.
+
+Each member's pod raises `fs.aio-max-nr` to 30 000 000 from a privileged init
+container (`ScyllaCluster.spec.sysctls`): ScyllaDB needs ~11 000 AIO slots per
+core, and GKE's default of 65 536 stops it from starting on 8+ vCPU machines
+(`io_setup: Resource temporarily unavailable`).
 
 ### Stop and start
 
@@ -335,6 +372,13 @@ data set. Stop refuses to delete anything if the backup fails, and a start that
 fails part-way can be retried (leftovers of the failed schema restore are
 dropped first — the cluster was created empty by the same workflow).
 `trigger-backup` on a stopped instance records the stop snapshot itself.
+
+**Writes acknowledged after the stop's snapshot are lost** (the backup runs
+while clients are still connected). In testing, 376 writes acknowledged in the
+~45 s between the snapshot and the cluster going down were missing after start
+(119 on AWS); everything written before the snapshot came back. Stop clients
+first if that matters. After start, members have new load-balancer addresses:
+clients must reconnect (the names follow, 60 s TTL).
 
 ### Restart
 
@@ -381,10 +425,14 @@ backup in it (`force_destroy = true`, which also removes its service account).
   rejects `AutomatedSnapshot`s, which includes `trigger-backup` ones); the
   others expire after `backupRetentionInDays`.
 - **Workflow finalization lags.** Backup, restart and restore workflows show
-  every step `success` but stay `RUNNING` for ~10–15 min; the instance is
-  locked (`conflicting operation is already in progress`) until then.
-- **Drivers behind the load balancer** must not follow the cluster topology
-  (members' addresses are private).
+  every step `success` but stay `RUNNING` for ~10–15 min, and a backup once
+  stayed `RUNNING` for 8 h ([omnistrate/tasks#2987](https://github.com/omnistrate/tasks/issues/2987)).
+  The instance is locked for `stop`/`start` (`conflicting operation is already
+  in progress`) until then. A no-op `omctl instance modify $I --param
+  '{"memberCount":"<current>"}'` is accepted anyway and ends the stuck workflow
+  (it's marked `FAILED`; its snapshot stays `COMPLETE`).
+- **One load balancer per member**, each billed by GCP (forwarding rule + data processed).
+- **The network setup is fixed at create** (`exposeOptions` is immutable).
 
 ## Parameters (`scylladb` resource)
 
@@ -432,6 +480,12 @@ copies identical when you change it. Validate with
 | Extra NVMe nodes appear during create/scale | Operator cleanup Jobs inherit the rack placement; the spec's `matchLabelKeys` anti-affinity keeps them on the members' nodes — if you edit placement, keep it |
 | auth Job fails `cannot log in` | Password with characters outside the regex, or the maintenance socket is disabled |
 | Backup Job fails `cluster is not registered with Scylla Manager` | `scylla-manager` amenity missing or unhealthy (`kubectl -n scylla-manager get pods`) |
+| ScyllaDB create fails at `nlbFirewall`: `Required 'compute.networks.get' permission` | Step 1: the Terraform service account needs `roles/compute.securityAdmin` and `roles/compute.networkViewer` |
+| Members `CrashLoopBackOff` for a minute right after create | Normal: the sidecar waits for its load balancer's ingress IP |
+| Internal ports (7000, 9180, …) answer from outside on a member address | `exposeOptions.nodeService.externalTrafficPolicy` isn't `Local` (the spec sets it); immutable, re-create the instance. Check: `nc -z <node-n name> 7000` must time out, 9042/19042/10001 must connect |
+| Restore target ends `FAILED`: `ReconcileOperatorCRD … child workflow execution already started`, although every restore step succeeded | Platform bug ([omnistrate/tasks#2988](https://github.com/omnistrate/tasks/issues/2988)). A no-op `omctl instance modify <target> --param '{"memberCount":"3"}'` brings it to `RUNNING`; verify your data |
+| Member stuck `2/4` after a machine-type change; ScyllaDB log `io_setup: Resource temporarily unavailable` / `scylla_io_setup … returned non-zero` | `fs.aio-max-nr` too low for the core count. The spec sets it (`spec.sysctls`); an instance on an older plan version must be upgraded (`omctl upgrade $I --version=<latest>`) |
+| Modify `FAILED`, ops Job `BackoffLimitExceeded`, a system node was just scaled down | The Job's pod was lost with its node. The spec marks Job pods `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` ([omnistrate/tasks#2992](https://github.com/omnistrate/tasks/issues/2992)); re-run the same modify |
 | `kubectl`: `You must be logged in to the server` | The kubeconfig token expired (~1 h). Run `update-kubeconfig` again |
 
 Debug a workflow and its Jobs:

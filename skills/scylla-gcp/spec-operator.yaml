@@ -13,16 +13,6 @@ features:
     logs:
   CUSTOMER:
     logs:
-loadBalancers:
-  https: []
-  tcp:
-    - name: cql
-      description: TCP ingress for CQL (port 9042).
-      ports:
-        - associatedResourceKeys:
-            - cqlProxy
-          ingressPort: 9042
-          backendPort: 9042
 services:
   - name: scylladb
     description: ScyllaDB cluster on local NVMe, managed by the ScyllaDB Operator.
@@ -43,6 +33,8 @@ services:
     network:
       ports:
         - 9042
+        - 19042
+        - 10001
     apiParameters:
       - key: gcpInstanceType
         name: Instance Type
@@ -249,6 +241,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -414,6 +408,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -646,6 +642,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster
                     dependencies:
@@ -684,6 +699,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -1116,11 +1132,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -1373,6 +1406,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster
               inputs:
                 parameters:
@@ -1405,10 +1485,24 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          cloud.google.com/l4-rbs: enabled
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        externalTrafficPolicy: Local
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -1518,6 +1612,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -1744,6 +1840,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster-async
                     dependencies:
@@ -1782,6 +1897,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -2214,11 +2330,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -2471,6 +2604,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster-async
               inputs:
                 parameters:
@@ -2502,10 +2682,24 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          cloud.google.com/l4-rbs: enabled
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        externalTrafficPolicy: Local
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -2615,6 +2809,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -2842,6 +3038,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster
                     dependencies:
@@ -2880,6 +3095,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -3340,11 +3556,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -3597,6 +3830,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster
               inputs:
                 parameters:
@@ -3629,10 +3909,24 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          cloud.google.com/l4-rbs: enabled
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        externalTrafficPolicy: Local
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -3742,6 +4036,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -3896,6 +4192,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4050,6 +4348,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4238,6 +4538,26 @@ services:
                       parameters:
                         - name: name
                           value: "{{inputs.parameters.instanceId}}-ops"
+                  - name: deleteopsdnsrolebinding
+                    template: delete-rolebinding
+                    dependencies:
+                      - deletecluster
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: external-dns-ns
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-ops-dns"
+                  - name: deleteopsdnsrole
+                    template: delete-role
+                    dependencies:
+                      - deleteopsdnsrolebinding
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: external-dns-ns
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: delete-cluster
               inputs:
                 parameters:
@@ -4460,6 +4780,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4634,6 +4956,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4864,6 +5188,25 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: instanceId
                           value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrole
+                    template: apply-ops-dnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: opsdnsrolebinding
+                    template: apply-ops-dnsrolebinding
+                    dependencies:
+                      - opssa
+                      - opsdnsrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: applycluster
                     template: apply-cluster
                     dependencies:
@@ -4902,6 +5245,7 @@ services:
                       - opsscripts
                       - opsrolebinding
                       - opsclusterrolebinding
+                      - opsdnsrolebinding
                     arguments:
                       parameters:
                         - name: namespace
@@ -5362,11 +5706,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -5619,6 +5980,53 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-ops-dnsrole
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      resourceNames:
+                        - external-dns
+                      verbs:
+                        - get
+            - name: apply-ops-dnsrolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
+                    namespace: external-dns-ns
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-ops"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-ops-dns"
             - name: apply-cluster
               inputs:
                 parameters:
@@ -5651,10 +6059,24 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
                         omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    exposeOptions:
+                      nodeService:
+                        type: LoadBalancer
+                        annotations:
+                          cloud.google.com/l4-rbs: enabled
+                          external-dns.alpha.kubernetes.io/ttl: '60'
+                        externalTrafficPolicy: Local
+                      broadcastOptions:
+                        clients:
+                          type: ServiceLoadBalancerIngress
+                        nodes:
+                          type: PodIP
                     datacenter:
                       name: dc1
                       racks:
@@ -5764,6 +6186,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -5830,25 +6254,28 @@ services:
                           - name: scripts
                             configMap:
                               name: "{{inputs.parameters.instanceId}}-ops-scripts"
+    endpointConfiguration:
+      cql:
+        host: $sys.network.externalClusterEndpoint
+        ports:
+          - 9042
+          - 19042
+        primary: true
+        networkingType: PUBLIC
     dependsOn:
-      - cqlProxy
-  - name: cqlProxy
-    description: Internal TCP proxy from the CQL load balancer to the ScyllaDB client Service.
+      - nlbFirewall
+  - name: nlbFirewall
+    description: VPC firewall rules closing the internal ScyllaDB ports of the member load balancers to the internet.
     internal: true
-    image: docker.io/alpine/socat:1.8.0.0
-    command:
-      - /bin/sh
-      - -ec
-    args:
-      - |
-        ID="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-        exec socat TCP-LISTEN:9042,fork,reuseaddr TCP:"${ID}-client:9042",connect-timeout=5
-    compute:
-      replicaCount: 1
-      rootVolumeSizeGi: 20
-      instanceTypes:
-        - name: e2-small
-          cloudProvider: gcp
-    network:
-      ports:
-        - 9042
+    terraformConfigurations:
+      configurationPerCloudProvider:
+        gcp:
+          terraformPath: /
+          artifactsLocalPath: terraform-nlb-fw
+          variablesValuesFileOverride: |
+            projectId = "{{ $sys.deploymentCell.gcp.projectID }}"
+            network   = "{{ $sys.deploymentCell.cloudProviderNetworkID }}"
+            planTag   = "product-tier-{{ $func.tolower($sys.deployment.planID) }}-id"
+          requiredOutputs:
+            - key: firewallName
+              exported: false

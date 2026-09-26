@@ -16,7 +16,7 @@ instructions:
 | Skill | Backups | Status | Contents |
 |---|---|---|---|
 | [`skills/scylla-aws/`](skills/scylla-aws/SKILL.md) | Amazon S3 | Deployed; every operation tested | `spec-operator.yaml` + `terraform-nlb-sg/`, `spec-s3-bucket.yaml` + `terraform/`, `amenities.yaml` |
-| [`skills/scylla-gcp/`](skills/scylla-gcp/SKILL.md) | Google Cloud Storage | Not deployed yet (GCP local SSD must be enabled for your org by Omnistrate support) | `spec-operator.yaml`, `spec-gcs-bucket.yaml` + `terraform/`, `amenities.yaml` |
+| [`skills/scylla-gcp/`](skills/scylla-gcp/SKILL.md) | Google Cloud Storage | Deployed; every operation tested (GCP local SSD must be enabled for your org by Omnistrate support) | `spec-operator.yaml` + `terraform-nlb-fw/`, `spec-gcs-bucket.yaml` + `terraform/`, `amenities.yaml` |
 
 Each `SKILL.md` covers:
 - the one-time IAM grant for Omnistrate's Terraform identity
@@ -55,7 +55,7 @@ cd scylladb-operator-spec/skills/scylla-aws     # or scylla-gcp; then follow SKI
 | ScyllaDB | 2026.2.5 via ScyllaDB Operator v1.22, production mode, 1–30 members (default 3) |
 | Storage | Node-local NVMe (`omnistrate-local-nvme`, RAID 0 of the instance-store disks); local-NVMe instance types only |
 | Placement | One member per node (hard rule), pinned to the instance's node pool |
-| Endpoints | **AWS:** one internet-facing NLB per member, so token/shard-aware drivers work from outside the VPC; a published contact point plus `node-<n>` names (external-dns); only CQL 9042/19042 and the token-protected Manager agent 10001 reachable. **GCP:** a public TCP load balancer to a proxy (`:9042`). Password auth on both |
+| Endpoints | One internet-facing load balancer per member (AWS: NLB; GCP: external passthrough LB), so token/shard-aware drivers work from outside the VPC; a published contact point plus `node-<n>` names (external-dns); only CQL 9042/19042 and the token-protected Manager agent 10001 reachable (AWS: a security group; GCP: VPC firewall rules). Password auth |
 | Lifecycle | create, modify (members, instance type, CPU/memory, version), stop / start, restart, delete, backup, restore, deleteBackup |
 | Custom actions | **Replace Member** (fresh local volume, data re-streamed) and **Replace Member VM** (move a member to a different node) |
 | Backups | Scylla Manager 3.12, 24h schedule, 7-day retention |
@@ -79,7 +79,8 @@ AWS:
    reconcile, restart, replace, delete-backup
 ```
 
-GCP: the same cluster behind `cqllb :9042 → cqlProxy (socat) → <id>-client :9042`.
+GCP: the same layout, with external passthrough load balancers (`externalTrafficPolicy: Local`) and an
+`nlbFirewall` Terraform resource whose VPC firewall rules keep the members' internal ports closed to the internet.
 
 Each ScyllaDB spec defines two resources:
 
@@ -87,10 +88,9 @@ Each ScyllaDB spec defines two resources:
   the `ScyllaCluster`, its Secrets/ConfigMaps and a small ops RBAC, and run
   short-lived Jobs that drive Scylla Manager (`sctool`) and `kubectl` for
   backup, restore, stop/start, member replacement and instance-type changes.
-- **AWS: `nlbSecurityGroup`**, an internal Terraform resource that creates the
-  per-member load balancers' security group. **GCP: `cqlProxy`**, an internal
-  `alpine/socat` pod that bridges the load-balancer port to the cluster's
-  client Service.
+- **`nlbSecurityGroup` (AWS) / `nlbFirewall` (GCP)**, an internal Terraform
+  resource that restricts the per-member load balancers to the client ports:
+  a security group on AWS, VPC firewall rules on GCP.
 
 Local NVMe doesn't survive releasing its VM, so **stop** takes a backup and
 releases the nodes, and **start** re-creates the cluster and restores that

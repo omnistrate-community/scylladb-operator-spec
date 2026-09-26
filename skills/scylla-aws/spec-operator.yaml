@@ -271,6 +271,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -436,6 +438,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -1148,11 +1152,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -1485,6 +1506,8 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
@@ -1611,6 +1634,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -2317,11 +2342,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -2653,6 +2695,8 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
@@ -2779,6 +2823,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -3514,11 +3560,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -3851,6 +3914,8 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
@@ -3977,6 +4042,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4131,6 +4198,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4285,6 +4354,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4705,6 +4776,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -4879,6 +4952,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -5617,11 +5692,28 @@ services:
                         done
                       }
 
+                      # A member left on a healthy node of another instance type (e.g. after an
+                      # interrupted type change) never goes Pending, so replace_stranded can't see it.
+                      # Once every member is ready, cordon its node and re-create its pod: the pod goes
+                      # Pending and replace_stranded moves it. One member at a time.
+                      move_off_wrong_type() {
+                        [ -n "${DESIRED_INSTANCE_TYPE:-}" ] && cluster_ready || return 0
+                        for p in $(members | sort -r); do
+                          n=$(k get pod "$p" -o jsonpath='{.spec.nodeName}')
+                          [ -n "$n" ] && [ "$(node_type "$n")" != "$DESIRED_INSTANCE_TYPE" ] || continue
+                          log "member $p runs on $n ($(node_type "$n")), not $DESIRED_INSTANCE_TYPE; cordoning the node and re-creating the pod"
+                          kubectl cordon "$n" >/dev/null
+                          k delete pod "$p" --wait=true >/dev/null
+                          return 0
+                        done
+                      }
+
                       do_reconcile() {
                         cluster_exists || die "cluster $CLUSTER does not exist"
                         until cluster_ready && all_on_type; do
                           check_deadline
                           replace_stranded
+                          move_off_wrong_type
                           every_minute "waiting for the change to roll out: $(status_line)"
                           sleep 15
                         done
@@ -5954,6 +6046,8 @@ services:
                     agentVersion: 3.12.0
                     developerMode: {{inputs.parameters.developerMode}}
                     automaticOrphanedNodeCleanup: true
+                    sysctls:
+                      - fs.aio-max-nr=30000000
                     podMetadata:
                       labels:
                         omnistrate.com/managed-by: omnistrate
@@ -6080,6 +6174,8 @@ services:
                     template:
                       metadata:
                         labels: *id001
+                        annotations:
+                          cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
                       spec:
                         restartPolicy: Never
                         serviceAccountName: "{{inputs.parameters.instanceId}}-ops"
@@ -6157,7 +6253,7 @@ services:
     dependsOn:
       - nlbSecurityGroup
   - name: nlbSecurityGroup
-    description: 'Front-end security group for the CQL load balancers: 9042/19042 only.'
+    description: 'Front-end security group for the member load balancers: CQL 9042/19042 and the agent port only.'
     internal: true
     terraformConfigurations:
       configurationPerCloudProvider:
