@@ -99,3 +99,93 @@ backup.
 The ScyllaDB Operator, Scylla Manager and the `ScyllaSnapshot` CRD are **not**
 in the specs. They're cluster-scoped, so they're installed once per deployment
 cell from `amenities.yaml`.
+
+## Performance
+
+`cassandra-stress` (ScyllaDB's `scylladb/cassandra-stress:3.21.1`) from three
+client pods in the same Kubernetes cluster (a separate Omnistrate plan, its own
+namespace and nodes: 3 × `c7i.2xlarge` / 3 × `n2-standard-8`), 256 threads each,
+against 3 members with 3 cores and 24 GiB for ScyllaDB each. 1 KiB rows,
+replication factor 3, `CL=QUORUM` for every operation. Clients connect like
+external ones: contact point, then each member's own load balancer. Prefill:
+15 M rows; write, read and mixed (1 write : 3 reads) ran 10 min each. Totals
+over the three clients; latencies are the worst client's. No errors in any phase.
+
+| Phase | AWS 3 × `i4i.xlarge` op/s | p50 / p99 / p99.9 (ms) | GCP 3 × `n2-highmem-4` op/s | p50 / p99 / p99.9 (ms) |
+|---|---|---|---|---|
+| Prefill (write) | 70,805 | 3.9 / 87 / 107 | 56,904 | 2.8 / 113 / 146 |
+| Write | 63,084 | 4.4 / 88 / 111 | 48,570 | 2.9 / 127 / 159 |
+| Read | 80,646 | 5.0 / 41 / 50 | 50,857 | 3.1 / 109 / 122 |
+| Mixed | 64,711 | 4.9 / 66 / 89 | 46,608 | 3.5 / 100 / 127 |
+
+These are saturation numbers (768 requests in flight): tail latencies reflect
+queueing at full load, not latency at a moderate rate.
+
+## Screenshots
+
+The managed service running on Omnistrate: a 3-member cluster on each cloud
+(AWS: 3 × `i4i.xlarge` in `us-east-1`; GCP: 3 × `n2-highmem-4` in `us-east1`)
+under a `cassandra-stress` load. Account, project, subscription and org
+details are blurred.
+
+### Omnistrate portal
+
+The two plans, one per cloud:
+
+![The ScyllaDB AWS and ScyllaDB GCP plans in the Omnistrate portal](docs/images/portal-plans.png)
+
+Plan blueprint: the `scylladb` operator resource and its Terraform-managed load-balancer security group (AWS) or firewall (GCP). The red `cqlProxy` card is the CQL proxy of earlier plan versions, which Omnistrate keeps as deprecated after it was removed from the spec:
+
+| AWS | GCP |
+|---|---|
+| ![AWS plan blueprint](docs/images/portal-architecture-aws.png) | ![GCP plan blueprint](docs/images/portal-architecture-gcp.png) |
+
+Workflows for the service, and one successful workflow with its steps (AWS: create; GCP: start, which re-creates the cluster and restores the stop backup):
+
+![Workflow list for the ScyllaDB service](docs/images/portal-workflows.png)
+
+| AWS | GCP |
+|---|---|
+| ![AWS create workflow with its steps](docs/images/portal-workflow-aws.png) | ![GCP start workflow with its steps](docs/images/portal-workflow-gcp.png) |
+
+Instance details: status, instance type, members and parameters (secrets masked):
+
+| AWS | GCP |
+|---|---|
+| ![AWS instance details](docs/images/portal-instance-aws.png) | ![GCP instance details](docs/images/portal-instance-gcp.png) |
+
+Endpoints: the CQL contact point (9042 and shard-aware 19042) and Grafana:
+
+| AWS | GCP |
+|---|---|
+| ![AWS instance endpoints](docs/images/portal-endpoints-aws.png) | ![GCP instance endpoints](docs/images/portal-endpoints-gcp.png) |
+
+Nodes: the ScyllaDB members, monitoring pods and completed ops Jobs:
+
+| AWS | GCP |
+|---|---|
+| ![AWS instance nodes](docs/images/portal-nodes-aws.png) | ![GCP instance nodes](docs/images/portal-nodes-gcp.png) |
+
+Backups taken by Scylla Manager (24 h RPO, 7-day retention):
+
+| AWS | GCP |
+|---|---|
+| ![AWS instance backups](docs/images/portal-backups-aws.png) | ![GCP instance backups](docs/images/portal-backups-gcp.png) |
+
+### Monitoring (Grafana)
+
+The ScyllaDB dashboards, one folder per ScyllaDB release (the same on both clouds):
+
+![Grafana dashboard list with the scylladb-* folders](docs/images/grafana-dashboards.png)
+
+Overview (`scylladb-2026.2`) during the load: requests/s, latencies, nodes up:
+
+| AWS | GCP |
+|---|---|
+| ![AWS Grafana Overview dashboard under load](docs/images/grafana-overview-aws.png) | ![GCP Grafana Overview dashboard under load](docs/images/grafana-overview-gcp.png) |
+
+Detailed: load, requests and reads/writes per member, tablets per member:
+
+| AWS | GCP |
+|---|---|
+| ![AWS Grafana Detailed dashboard](docs/images/grafana-detailed-aws.png) | ![GCP Grafana Detailed dashboard](docs/images/grafana-detailed-gcp.png) |
