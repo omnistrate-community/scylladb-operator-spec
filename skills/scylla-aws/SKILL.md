@@ -281,27 +281,37 @@ IPs. Each member also gets a stable name, `node-<n>.<id>.<cell>.<region>.aws.<do
 `$I` is the ScyllaDB instance ID. After any change, wait for
 `omctl instance describe $I --deployment-status | jq -r .status` → `RUNNING`.
 
-All rows were exercised against live 3-member clusters (`i4i.large` →
-`i4i.xlarge`) with an RF-3 test table read back at `CONSISTENCY ALL` after every
-step — with the per-member load balancers, from outside AWS through the
-published endpoint with the Python `scylla-driver`, which found and used every
-member each time. Times are for that small data set; data-moving operations
-(restore, start, member/VM replace, instance-type change) scale with data size.
+Tested end to end on a 3-member cluster (`i4i.large`, per-member load
+balancers) holding **2,000,000 rows (~2 GB per replica, 1 KiB incompressible
+values)**, with a client **writing continuously from outside AWS through the
+public endpoint** (QUORUM writes, every acknowledged write recorded, random
+reads validated). After each operation: a full-content verification of every
+row against a checksum, and a check that every acknowledged write is present at
+`CONSISTENCY ALL`.
 
-| Operation | Command | Tested |
-|---|---|---|
-| Backup | `omctl instance trigger-backup $I` | ✅ ~40 s |
-| Restore (new instance) | `omctl instance restore $I --snapshot-id <snap>` | ✅ ~12 min incl. new nodes (see below: may end `FAILED` although it worked) |
-| Add members (3 → 4) | `omctl instance modify $I --param '{"memberCount":"4"}'` | ✅ ~6.5 min, new member gets its own NLB and `node-3` name |
-| Remove members (4 → 3) | `omctl instance modify $I --param '{"memberCount":"3"}'` | ✅ ~3 min |
-| Change instance type | `omctl instance modify $I --param '{"awsInstanceType":"i4i.xlarge","cpuQuantity":"3","memoryQuantity":"24Gi"}'` | ✅ ~25 min for 3 members |
-| Stop | `omctl instance stop $I` | ✅ ~1.5 min; NVMe nodes gone ~4 min later |
-| Start | `omctl instance start $I` | ✅ ~7 min; new NLBs, names follow |
-| Rolling restart | `omctl instance restart $I` | ✅ ~4 min (pod by pod) |
-| Replace a member | `omctl instance operation trigger $I replaceMember --param '{"member":"<id>-dc1-rack1-2"}' -y` | ✅ ~3.5 min |
-| Replace a member's VM | `omctl instance operation trigger $I replaceMemberVM --param '{"member":"<id>-dc1-rack1-1"}' -y` | ✅ ~6.5 min; old VM removed by the autoscaler |
-| Delete a snapshot | automatic, when a snapshot expires (7 days) | ✅ files removed (see Known limits) |
-| Delete | `omctl instance delete $I --yes` | ✅ namespace, cluster RBAC and local PVs gone |
+| Operation | Command | Time | Dataset | Acked writes | Client errors during op |
+|---|---|---|---|---|---|
+| Plan-version upgrade | `omctl instance version-upgrade $I --target-tier-version <v>` | 2 min | identical | 0 missing | 0 |
+| Rolling restart | `omctl instance restart $I` | 4.5 min | identical | 0 missing | 0 |
+| Add member (3 → 4) | `omctl instance modify $I --param '{"memberCount":"4"}'` | 9 min | identical | 0 missing | 0 |
+| Remove member (4 → 3) | `omctl instance modify $I --param '{"memberCount":"3"}'` | 3 min | identical | 0 missing | 0 |
+| Replace a member | `omctl instance operation trigger $I replaceMember --param '{"member":"<id>-dc1-rack1-1"}' -y` | 6.6 min (~1.6 GB re-streamed) | identical | 0 missing | 0 |
+| Replace a member's VM | `omctl instance operation trigger $I replaceMemberVM --param '{"member":"<id>-dc1-rack1-2"}' -y` | 9.7 min | identical | 0 missing | 0 |
+| VM size up (`i4i.large` → `i4i.xlarge`) | `omctl instance modify $I --param '{"awsInstanceType":"i4i.xlarge","cpuQuantity":"3","memoryQuantity":"24Gi"}'` | 29 min | identical | 0 missing | 0 |
+| VM size down (`i4i.xlarge` → `i4i.large`) | `omctl instance modify $I --param '{"awsInstanceType":"i4i.large","cpuQuantity":"1","memoryQuantity":"10Gi"}'` | 29 min | identical | 0 missing | 0 |
+| ScyllaDB upgrade (2026.2.5 → 2026.2.7) | `omctl instance modify $I --param '{"scyllaVersion":"2026.2.7"}'` | 11 min | identical | 0 missing | 0 |
+| Backup | `omctl instance trigger-backup $I` | ~1 min | — | — | 0 |
+| Restore into a new instance | `omctl instance restore $I --snapshot-id <snap>` | 15 min | **identical checksum on the new instance** | — | — |
+| Stop / start | `omctl instance stop $I` / `omctl instance start $I` | 2 min / 9 min | identical | **119 missing** — the writes acknowledged in the ~16 s between the stop's snapshot and teardown (see Stop and start) | expected (instance down) |
+| Snapshot delete | automatic on expiry (runs the deleteBackup workflow) | — | — | — | — |
+| Delete | `omctl instance delete $I --yes` | 4 min | — | — | — |
+
+Snapshot delete was verified by running the deleteBackup Job directly (the
+snapshot disappears from Scylla Manager's listing; positive control included).
+Delete was verified to leave nothing behind: namespace, NLBs, security group,
+DNS names, cluster RBAC, the `external-dns-ns` Role, and — after the local-NVMe
+PV reaper's next 15-minute run — the volumes. `storageGiB` is fixed at create
+(local NVMe can't grow); more storage = a larger instance type.
 
 Member names are `<instance-id>-dc1-rack1-<n>`
 (`kubectl -n $I get pods -l scylla/cluster=$I`). Custom operations (the two
@@ -363,6 +373,13 @@ restore into a new instance instead). Nodes of the old type are removed by the
 autoscaler once empty.
 
 ### Stop and start
+
+**Stop your writers before stopping the instance.** Stop is not a graceful
+drain: writes acknowledged after the stop's backup snapshot but before the
+cluster is deleted are lost (measured: 119 writes, ~16 s at ~7.5 writes/s).
+After a start every member is behind a new load balancer address, so clients
+must reconnect (a long-running Python driver took ~15 min to rediscover the
+members on its own).
 
 Local NVMe does not survive releasing its VM, so **stop = backup + release**:
 the stop Job takes a Scylla Manager backup, records its tag in the
