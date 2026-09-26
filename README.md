@@ -7,6 +7,8 @@ StorageClass, per-instance namespace, load balancers, DNS). The ScyllaDB
 Operator runs ScyllaDB, and Scylla Manager takes backups to the cloud's object
 store.
 
+Home: [omnistrate-community/scylladb-operator-spec](https://github.com/omnistrate-community/scylladb-operator-spec).
+
 There's one ready-to-deploy folder per cloud, packaged as an
 [agent skill](https://agentskills.io) with step-by-step `omnistrate-ctl`
 instructions:
@@ -33,16 +35,16 @@ With the [`skills` CLI](https://github.com/vercel-labs/skills), which detects
 your agents (Claude Code, Codex, Copilot, …):
 
 ```bash
-npx skills add <owner>/<repo>                    # both skills
-npx skills add <owner>/<repo> -s scylla-aws      # just one
-npx skills add <owner>/<repo> --list             # list without installing
+npx skills add omnistrate-community/scylladb-operator-spec                   # both skills
+npx skills add omnistrate-community/scylladb-operator-spec -s scylla-aws     # just one
+npx skills add omnistrate-community/scylladb-operator-spec --list            # list without installing
 ```
 
 To use the specs without an agent:
 
 ```bash
-git clone https://github.com/<owner>/<repo>
-cd <repo>/skills/scylla-aws     # or scylla-gcp; then follow SKILL.md
+git clone https://github.com/omnistrate-community/scylladb-operator-spec
+cd scylladb-operator-spec/skills/scylla-aws     # or scylla-gcp; then follow SKILL.md
 ```
 
 ## What you get
