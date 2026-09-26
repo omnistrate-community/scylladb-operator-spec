@@ -202,8 +202,9 @@ Rules:
 ### 6. Create a ScyllaDB instance
 
 ```bash
-jq -n --slurpfile o gcs-outputs.json --arg pw '<strong-password-12+chars>' '{
+jq -n --slurpfile o gcs-outputs.json --arg pw '<strong-password-12+chars>' --arg gpw '<grafana-password-12+chars>' '{
   adminPassword: $pw,
+  grafanaPassword: $gpw,
   memberCount: "3",
   gcpInstanceType: "n2-highmem-4",
   cpuQuantity: "3",
@@ -283,6 +284,38 @@ few of them as extra contact points.
   the member's own node. Client IPs are preserved as a side effect.
 - A stop/start re-creates the load balancers: members get new addresses, the
   names follow (60 s TTL).
+
+### 8. Monitoring (Prometheus + Grafana)
+
+Omnistrate's built-in logs and metrics are **off** (the spec has no
+`features`). Each instance instead gets the ScyllaDB Operator's own stack
+([ScyllaDB monitoring](https://operator.docs.scylladb.com/stable/understand/monitoring.html)),
+in the instance namespace, on the cell's system nodes:
+
+- a `Prometheus` run by the cell's Prometheus Operator (Omnistrate's
+  observability amenity provides it), scraping only this cluster: ScyllaDB and
+  node_exporter on every member; 15 days / 18 GB retention on a 20 GiB volume
+  of the cell's default StorageClass
+- a `ScyllaDBMonitoring` in External mode: the ServiceMonitor, ScyllaDB's
+  alerting rules, and a Grafana with the ScyllaDB and Scylla Manager dashboards
+
+```bash
+omctl instance list-endpoints <id>      # → grafana: grafana.<cql endpoint name> :443
+open "https://grafana.r-<resource>.<id>.<cell zone>"    # user admin, password grafanaPassword
+```
+
+Grafana is exposed through the cell's NGINX Ingress (the operator's own Grafana
+`exposeOptions` are deprecated in favour of an Ingress): a public certificate
+from the cell's cert-manager (`google-public-ca`) and the name published by the
+cell's external-dns. Anonymous access is off; the admin password is the
+`grafanaPassword` parameter (the operator keeps the password in its
+`<id>-grafana-admin-credentials` Secret, and the workflow's `monitoring` Job
+sets it, then waits for Grafana to restart with it). Changing
+`grafanaPassword` with a modify changes it.
+
+Verified on both clouds: no or wrong credentials → `401`, `grafanaPassword` →
+`200`, all members scraped; also on a restore target (it gets its own Grafana
+and name).
 
 ## Day-2 operations
 
@@ -442,6 +475,7 @@ backup in it (`force_destroy = true`, which also removes its service account).
 |---|---|---|
 | `adminPassword` | required | 12–128 chars of `A-Za-z0-9!@#%^&*()_+=.-`. Fixed |
 | `adminUsername` | `admin` | CQL superuser. Fixed |
+| `grafanaPassword` | required | Password of Grafana's `admin` user, same character rules. Can be changed with a modify |
 | `gcpInstanceType` | `n2-highmem-4` | n2 machine types, each with 2 local SSDs |
 | `memberCount` | `3` | Members (1–30), one per node. Not called `replicaCount`: the platform overrides a parameter with that key during `start` |
 | `cpuQuantity` / `memoryQuantity` | `3` / `24Gi` | Scylla container, requests = limits |
@@ -486,6 +520,8 @@ copies identical when you change it. Validate with
 | Restore target ends `FAILED`: `ReconcileOperatorCRD … child workflow execution already started`, although every restore step succeeded | Platform bug ([omnistrate/tasks#2988](https://github.com/omnistrate/tasks/issues/2988)). A no-op `omctl instance modify <target> --param '{"memberCount":"3"}'` brings it to `RUNNING`; verify your data |
 | Member stuck `2/4` after a machine-type change; ScyllaDB log `io_setup: Resource temporarily unavailable` / `scylla_io_setup … returned non-zero` | `fs.aio-max-nr` too low for the core count. The spec sets it (`spec.sysctls`); an instance on an older plan version must be upgraded (`omctl upgrade $I --version=<latest>`) |
 | Modify `FAILED`, ops Job `BackoffLimitExceeded`, a system node was just scaled down | The Job's pod was lost with its node. The spec marks Job pods `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` ([omnistrate/tasks#2992](https://github.com/omnistrate/tasks/issues/2992)); re-run the same modify |
+| Upgrading an older instance fails: `unresolved workflow input parameters: [$var.grafanaPassword]` | The instance predates the parameter. Set it: `omctl instance modify $I --param '{"grafanaPassword":"<password>"}'` (accepted on the new version; the modify installs the monitoring stack) |
+| Grafana URL fails TLS for a minute or two after create | cert-manager is still issuing the certificate (`kubectl -n $I get certificate`) |
 | `kubectl`: `You must be logged in to the server` | The kubeconfig token expired (~1 h). Run `update-kubeconfig` again |
 
 Debug a workflow and its Jobs:

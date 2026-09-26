@@ -196,8 +196,9 @@ Rules:
 ### 6. Create a ScyllaDB instance
 
 ```bash
-jq -n --slurpfile o s3-outputs.json --arg pw '<strong-password-12+chars>' '{
+jq -n --slurpfile o s3-outputs.json --arg pw '<strong-password-12+chars>' --arg gpw '<grafana-password-12+chars>' '{
   adminPassword: $pw,
+  grafanaPassword: $gpw,
   memberCount: "3",
   awsInstanceType: "i4i.xlarge",
   cpuQuantity: "3",
@@ -275,6 +276,38 @@ IPs. Each member also gets a stable name, `node-<n>.<id>.<cell>.<region>.aws.<do
   NLB's per-AZ addresses, and members may live in any AZ.
 - A stop/start re-creates the load balancers: members get new addresses, the
   names follow (60 s TTL).
+
+### 8. Monitoring (Prometheus + Grafana)
+
+Omnistrate's built-in logs and metrics are **off** (the spec has no
+`features`). Each instance instead gets the ScyllaDB Operator's own stack
+([ScyllaDB monitoring](https://operator.docs.scylladb.com/stable/understand/monitoring.html)),
+in the instance namespace, on the cell's system nodes:
+
+- a `Prometheus` run by the cell's Prometheus Operator (Omnistrate's
+  observability amenity provides it), scraping only this cluster: ScyllaDB and
+  node_exporter on every member; 15 days / 18 GB retention on a 20 GiB volume
+  of the cell's default StorageClass
+- a `ScyllaDBMonitoring` in External mode: the ServiceMonitor, ScyllaDB's
+  alerting rules, and a Grafana with the ScyllaDB and Scylla Manager dashboards
+
+```bash
+omctl instance list-endpoints <id>      # → grafana: grafana.<cql endpoint name> :443
+open "https://grafana.r-<resource>.<id>.<cell zone>"    # user admin, password grafanaPassword
+```
+
+Grafana is exposed through the cell's NGINX Ingress (the operator's own Grafana
+`exposeOptions` are deprecated in favour of an Ingress): a public certificate
+from the cell's cert-manager (`google-public-ca`) and the name published by the
+cell's external-dns. Anonymous access is off; the admin password is the
+`grafanaPassword` parameter (the operator keeps the password in its
+`<id>-grafana-admin-credentials` Secret, and the workflow's `monitoring` Job
+sets it, then waits for Grafana to restart with it). Changing
+`grafanaPassword` with a modify changes it.
+
+Verified on both clouds: no or wrong credentials → `401`, `grafanaPassword` →
+`200`, all members scraped; also on a restore target (it gets its own Grafana
+and name).
 
 ## Day-2 operations
 
@@ -450,6 +483,7 @@ backup in it (`force_destroy = true`).
 |---|---|---|
 | `adminPassword` | required | 12–128 chars of `A-Za-z0-9!@#%^&*()_+=.-`. Fixed |
 | `adminUsername` | `admin` | CQL superuser. Fixed |
+| `grafanaPassword` | required | Password of Grafana's `admin` user, same character rules. Can be changed with a modify |
 | `awsInstanceType` | `i4i.xlarge` | Local-NVMe types only (i4i, i3en, i7ie, i4g, m6id, r6id) |
 | `memberCount` | `3` | Members (1–30), one per node. Not called `replicaCount`: the platform overrides a parameter with that key during `start` |
 | `cpuQuantity` / `memoryQuantity` | `3` / `24Gi` | Scylla container, requests = limits |
@@ -489,6 +523,8 @@ copies identical when you change it. Validate with
 | Restore target members `Pending`: `didn't match Pod's node affinity` | Placement pinned by `omnistrate.com/resource` — in a restore that renders another resource's ID. Pin by `resource-alias` + `product-tier-id` (the spec does) |
 | Restore fails at once: `unresolved workflow input parameters: [$sys.compute.node.instanceType $sys.network.externalClusterEndpoint]` | Neither renders for a restore target; the spec uses `$var.awsInstanceType` and derives the endpoint name. If you still see it, the snapshot is from an older plan version — take a new one |
 | Nothing but 9042 answers on a member address from outside | Expected for 7000/7001/7199/9180/10000; 19042 and 10001 must answer (`nc -z <node-n name> 19042`) |
+| Upgrading an older instance fails: `unresolved workflow input parameters: [$var.grafanaPassword]` | The instance predates the parameter. Set it: `omctl instance modify $I --param '{"grafanaPassword":"<password>"}'` (accepted on the new version; the modify installs the monitoring stack) |
+| Grafana URL fails TLS for a minute or two after create | cert-manager is still issuing the certificate (`kubectl -n $I get certificate`) |
 | `kubectl`: `You must be logged in to the server` | The kubeconfig token expired (~1 h). Run `update-kubeconfig` again |
 
 Debug a workflow and its Jobs:

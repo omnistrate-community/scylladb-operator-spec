@@ -59,7 +59,7 @@ cd scylladb-operator-spec/skills/scylla-aws     # or scylla-gcp; then follow SKI
 | Lifecycle | create, modify (members, instance type, CPU/memory, version), stop / start, restart, delete, backup, restore, deleteBackup |
 | Custom actions | **Replace Member** (fresh local volume, data re-streamed) and **Replace Member VM** (move a member to a different node) |
 | Backups | Scylla Manager 3.12, 24h schedule, 7-day retention |
-| Logs | Pod and database logs in the Omnistrate console |
+| Monitoring | Per instance: Prometheus + Grafana from the ScyllaDB Operator (`ScyllaDBMonitoring`) with the ScyllaDB dashboards and alert rules; Grafana at `grafana.<endpoint>` behind the cell's NGINX Ingress, public TLS, password-protected (`grafanaPassword`). Omnistrate's built-in logs/metrics are off |
 
 ## Architecture
 

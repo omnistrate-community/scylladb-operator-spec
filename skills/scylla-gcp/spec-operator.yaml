@@ -8,11 +8,6 @@ deployment:
     gcpProjectId: "<GCP_PROJECT_ID>"
     gcpProjectNumber: "<GCP_PROJECT_NUMBER>"
     gcpServiceAccountEmail: "<GCP_BOOTSTRAP_SA_EMAIL>"
-features:
-  INTERNAL:
-    logs:
-  CUSTOMER:
-    logs:
 services:
   - name: scylladb
     description: ScyllaDB cluster on local NVMe, managed by the ScyllaDB Operator.
@@ -122,6 +117,14 @@ services:
         description: Password of the CQL superuser.
         type: Password
         modifiable: false
+        required: true
+        export: true
+        regex: ^[A-Za-z0-9!@#%^&*()_+=.-]{12,128}$
+      - key: grafanaPassword
+        name: Grafana Password
+        description: Password of the Grafana admin user (ScyllaDB dashboards at the grafana endpoint).
+        type: Password
+        modifiable: true
         required: true
         export: true
         regex: ^[A-Za-z0-9!@#%^&*()_+=.-]{12,128}$
@@ -514,6 +517,8 @@ services:
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
+              - name: grafanaPassword
+                value: "{{ $var.grafanaPassword }}"
               - name: contactHost
                 value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupGcsBucketName
@@ -537,6 +542,7 @@ services:
                   - name: planId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
@@ -576,6 +582,8 @@ services:
                           value: "{{inputs.parameters.adminUsername}}"
                         - name: adminPassword
                           value: "{{inputs.parameters.adminPassword}}"
+                        - name: grafanaPassword
+                          value: "{{inputs.parameters.grafanaPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
                         - name: contactHost
@@ -636,6 +644,53 @@ services:
                     dependencies:
                       - opssa
                       - opsclusterrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheussa
+                    template: apply-prometheus-sa
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrole
+                    template: apply-prometheus-role
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrolebinding
+                    template: apply-prometheus-rolebinding
+                    dependencies:
+                      - prometheussa
+                      - prometheusrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheus
+                    template: apply-prometheus
+                    dependencies:
+                      - prometheusrolebinding
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: monitoring
+                    template: apply-monitoring
+                    dependencies:
+                      - prometheus
                     arguments:
                       parameters:
                         - name: namespace
@@ -724,6 +779,35 @@ services:
                           value: "{{inputs.parameters.instanceId}}-auth"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
+                  - name: deletegrafanajob
+                    template: delete-job
+                    dependencies:
+                      - authjob
+                      - monitoring
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                  - name: grafanajob
+                    template: run-ops-job
+                    dependencies:
+                      - deletegrafanajob
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                        - name: op
+                          value: monitoring
+                        - name: arg
+                          value: ''
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                        - name: instanceType
+                          value: "{{inputs.parameters.instanceType}}"
             - name: apply-agent-config
               inputs:
                 parameters:
@@ -772,6 +856,7 @@ services:
                   - name: instanceId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: backupGcsBucketName
                   - name: contactHost
               resource:
@@ -788,6 +873,7 @@ services:
                   stringData:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
+                    GRAFANA_PASSWORD: "{{inputs.parameters.grafanaPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
                     CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
@@ -840,6 +926,7 @@ services:
                       #   restart        rolling restart of every member, one pod at a time
                       #   replace        replace member $ARG (fresh local volume, data re-streamed)
                       #   replace-vm     cordon member $ARG's node, then replace it onto another node
+                      #   monitoring     set the Grafana admin password and expose Grafana through an Ingress
                       # NOTE: never write a double opening brace here -- the workflow engine would
                       # try to template it.
                       set -eu
@@ -975,8 +1062,9 @@ services:
                       # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
                       # member. The operator gives all member Services the same annotations, so this
                       # is done per member.
-                      sync_dns() {
-                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                      # Sets CONTACT_HOST (the instance's endpoint name) when the workflow couldn't
+                      # render it, and ZONE (the instance's DNS zone); returns 1 if neither is known.
+                      contact_host() {
                         if [ -z "${CONTACT_HOST:-}" ]; then
                           # restore targets get no endpoint name at render time; build Omnistrate's
                           # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
@@ -988,9 +1076,15 @@ services:
                           [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
                         fi
                         case "${CONTACT_HOST:-}" in
-                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
-                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                          *."$CLUSTER".*) ZONE=${CONTACT_HOST#*.} ;;
+                          *) return 1 ;;
                         esac
+                      }
+
+                      sync_dns() {
+                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                        contact_host || { log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0; }
+                        zone=$ZONE
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
@@ -1210,6 +1304,67 @@ services:
                         [ -z "${node:-}" ] || log "node $node stays cordoned and is removed by the autoscaler once empty"
                       }
 
+                      # ScyllaDBMonitoring's Grafana: the operator generates its admin password and
+                      # keeps whatever the Secret holds, re-rendering Grafana when it changes; Grafana
+                      # (emptyDir storage) takes it on every start. Exposed through the cell's NGINX
+                      # Ingress at grafana.<endpoint name>, with a public certificate from cert-manager
+                      # and the name published by external-dns. Grafana itself serves HTTPS only.
+                      do_monitoring() {
+                        sec="$CLUSTER-grafana-admin-credentials"
+                        until k get secret "$sec" >/dev/null 2>&1; do
+                          check_deadline
+                          every_minute "waiting for the operator to create $sec"
+                          sleep 5
+                        done
+                        want=$(printf '%s' "${GRAFANA_PASSWORD:-}" | base64 | tr -d '\n')
+                        if [ -z "${GRAFANA_PASSWORD:-}" ]; then
+                          # an instance from an older plan version has no grafanaPassword yet: keep the
+                          # operator's random one until the parameter is set with a modify
+                          log "grafanaPassword not set; Grafana keeps its generated admin password (set grafanaPassword to choose one)"
+                        elif [ "$(k get secret "$sec" -o jsonpath='{.data.password}')" != "$want" ]; then
+                          k patch secret "$sec" --type merge -p '{"data":{"password":"'"$want"'"}}' >/dev/null
+                          log "Grafana admin password set"
+                        fi
+                        contact_host || die "can't determine the instance's endpoint name for the Grafana Ingress"
+                        host="grafana.$CONTACT_HOST"
+                        cat <<EOF | k apply -f - >/dev/null
+                      apiVersion: networking.k8s.io/v1
+                      kind: Ingress
+                      metadata:
+                        name: $CLUSTER-grafana
+                        namespace: $NS
+                        labels:
+                          omnistrate.com/instance: $CLUSTER
+                        annotations:
+                          cert-manager.io/cluster-issuer: ${GRAFANA_ISSUER:-google-public-ca}
+                          nginx.org/ssl-services: $CLUSTER-grafana
+                          external-dns.alpha.kubernetes.io/ttl: "60"
+                      spec:
+                        ingressClassName: nginx
+                        tls:
+                          - hosts: [$host]
+                            secretName: $CLUSTER-grafana-tls
+                        rules:
+                          - host: $host
+                            http:
+                              paths:
+                                - path: /
+                                  pathType: Prefix
+                                  backend:
+                                    service:
+                                      name: $CLUSTER-grafana
+                                      port:
+                                        number: 3000
+                      EOF
+                        until [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.updatedReplicas}/{.status.availableReplicas}/{.spec.replicas}' 2>/dev/null)" = 1/1/1 ] &&
+                              [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.metadata.generation}')" = "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.observedGeneration}')" ]; do
+                          check_deadline
+                          every_minute "waiting for Grafana to roll out"
+                          sleep 5
+                        done
+                        log "Grafana: https://$host (user admin)"
+                      }
+
                       case "$OP" in
                         auth) do_auth ;;
                         backup) do_backup ;;
@@ -1220,6 +1375,7 @@ services:
                         reconcile) do_reconcile ;;
                         restart) do_restart ;;
                         replace | replace-vm) do_replace ;;
+                        monitoring) do_monitoring ;;
                         *) die "unknown operation $OP" ;;
                       esac
             - name: apply-ops-sa
@@ -1332,6 +1488,34 @@ services:
                         - watch
                         - patch
                         - delete
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - secrets
+                      resourceNames:
+                        - "{{inputs.parameters.instanceId}}-grafana-admin-credentials"
+                      verbs:
+                        - get
+                        - patch
+                    - apiGroups:
+                        - networking.k8s.io
+                      resources:
+                        - ingresses
+                      verbs:
+                        - get
+                        - list
+                        - create
+                        - patch
+                        - update
+                        - delete
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      verbs:
+                        - get
+                        - list
+                        - watch
             - name: apply-ops-rolebinding
               inputs:
                 parameters:
@@ -1406,6 +1590,194 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-prometheus-sa
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+            - name: apply-prometheus-role
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - services
+                        - endpoints
+                        - pods
+                      verbs:
+                        - get
+                        - list
+                        - watch
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - configmaps
+                      verbs:
+                        - get
+                    - apiGroups:
+                        - discovery.k8s.io
+                      resources:
+                        - endpointslices
+                      verbs:
+                        - get
+                        - list
+                        - watch
+            - name: apply-prometheus-rolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-prometheus"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+            - name: apply-prometheus
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: Prometheus
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    replicas: 1
+                    serviceAccountName: "{{inputs.parameters.instanceId}}-prometheus"
+                    serviceMonitorSelector: &id001
+                      matchLabels:
+                        scylla-operator.scylladb.com/scylladbmonitoring-name: "{{inputs.parameters.instanceId}}"
+                    ruleSelector: *id001
+                    retention: 15d
+                    retentionSize: 18GB
+                    storage:
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 20Gi
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 512Mi
+                      limits:
+                        memory: 2Gi
+                    securityContext:
+                      runAsNonRoot: true
+                      runAsUser: 65534
+                      fsGroup: 65534
+                    podMetadata:
+                      labels:
+                        omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    affinity:
+                      nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          nodeSelectorTerms:
+                            - matchExpressions:
+                                - key: omnistrate.com/control-plane
+                                  operator: Exists
+                    tolerations:
+                      - key: CriticalAddonsOnly
+                        operator: Exists
+                        effect: NoSchedule
+                      - key: components.gke.io/gke-managed-components
+                        operator: Exists
+                        effect: NoSchedule
+            - name: apply-monitoring
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: scylla.scylladb.com/v1alpha1
+                  kind: ScyllaDBMonitoring
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    type: Platform
+                    endpointsSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: scylla
+                        scylla-operator.scylladb.com/scylla-service-type: member
+                        scylla/cluster: "{{inputs.parameters.instanceId}}"
+                    components:
+                      prometheus:
+                        mode: External
+                      grafana:
+                        placement:
+                          nodeAffinity:
+                            requiredDuringSchedulingIgnoredDuringExecution:
+                              nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: omnistrate.com/control-plane
+                                      operator: Exists
+                          tolerations:
+                            - key: CriticalAddonsOnly
+                              operator: Exists
+                              effect: NoSchedule
+                            - key: components.gke.io/gke-managed-components
+                              operator: Exists
+                              effect: NoSchedule
+                        resources:
+                          requests:
+                            cpu: 100m
+                            memory: 256Mi
+                          limits:
+                            memory: 1Gi
+                        datasources:
+                          - name: prometheus
+                            type: Prometheus
+                            url: "http://prometheus-operated.{{inputs.parameters.namespace}}.svc:9090"
+                            prometheusOptions: {}
             - name: apply-ops-dnsrole
               inputs:
                 parameters:
@@ -1712,6 +2084,8 @@ services:
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
+              - name: grafanaPassword
+                value: "{{ $var.grafanaPassword }}"
               - name: contactHost
                 value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupGcsBucketName
@@ -1735,6 +2109,7 @@ services:
                   - name: planId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
@@ -1774,6 +2149,8 @@ services:
                           value: "{{inputs.parameters.adminUsername}}"
                         - name: adminPassword
                           value: "{{inputs.parameters.adminPassword}}"
+                        - name: grafanaPassword
+                          value: "{{inputs.parameters.grafanaPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
                         - name: contactHost
@@ -1834,6 +2211,53 @@ services:
                     dependencies:
                       - opssa
                       - opsclusterrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheussa
+                    template: apply-prometheus-sa
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrole
+                    template: apply-prometheus-role
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrolebinding
+                    template: apply-prometheus-rolebinding
+                    dependencies:
+                      - prometheussa
+                      - prometheusrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheus
+                    template: apply-prometheus
+                    dependencies:
+                      - prometheusrolebinding
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: monitoring
+                    template: apply-monitoring
+                    dependencies:
+                      - prometheus
                     arguments:
                       parameters:
                         - name: namespace
@@ -1922,6 +2346,35 @@ services:
                           value: "{{inputs.parameters.instanceId}}-reconcile"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
+                  - name: deletegrafanajob
+                    template: delete-job
+                    dependencies:
+                      - reconcile
+                      - monitoring
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                  - name: grafanajob
+                    template: run-ops-job
+                    dependencies:
+                      - deletegrafanajob
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                        - name: op
+                          value: monitoring
+                        - name: arg
+                          value: ''
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                        - name: instanceType
+                          value: "{{inputs.parameters.instanceType}}"
             - name: apply-agent-config
               inputs:
                 parameters:
@@ -1970,6 +2423,7 @@ services:
                   - name: instanceId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: backupGcsBucketName
                   - name: contactHost
               resource:
@@ -1986,6 +2440,7 @@ services:
                   stringData:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
+                    GRAFANA_PASSWORD: "{{inputs.parameters.grafanaPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
                     CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
@@ -2038,6 +2493,7 @@ services:
                       #   restart        rolling restart of every member, one pod at a time
                       #   replace        replace member $ARG (fresh local volume, data re-streamed)
                       #   replace-vm     cordon member $ARG's node, then replace it onto another node
+                      #   monitoring     set the Grafana admin password and expose Grafana through an Ingress
                       # NOTE: never write a double opening brace here -- the workflow engine would
                       # try to template it.
                       set -eu
@@ -2173,8 +2629,9 @@ services:
                       # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
                       # member. The operator gives all member Services the same annotations, so this
                       # is done per member.
-                      sync_dns() {
-                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                      # Sets CONTACT_HOST (the instance's endpoint name) when the workflow couldn't
+                      # render it, and ZONE (the instance's DNS zone); returns 1 if neither is known.
+                      contact_host() {
                         if [ -z "${CONTACT_HOST:-}" ]; then
                           # restore targets get no endpoint name at render time; build Omnistrate's
                           # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
@@ -2186,9 +2643,15 @@ services:
                           [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
                         fi
                         case "${CONTACT_HOST:-}" in
-                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
-                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                          *."$CLUSTER".*) ZONE=${CONTACT_HOST#*.} ;;
+                          *) return 1 ;;
                         esac
+                      }
+
+                      sync_dns() {
+                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                        contact_host || { log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0; }
+                        zone=$ZONE
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
@@ -2408,6 +2871,67 @@ services:
                         [ -z "${node:-}" ] || log "node $node stays cordoned and is removed by the autoscaler once empty"
                       }
 
+                      # ScyllaDBMonitoring's Grafana: the operator generates its admin password and
+                      # keeps whatever the Secret holds, re-rendering Grafana when it changes; Grafana
+                      # (emptyDir storage) takes it on every start. Exposed through the cell's NGINX
+                      # Ingress at grafana.<endpoint name>, with a public certificate from cert-manager
+                      # and the name published by external-dns. Grafana itself serves HTTPS only.
+                      do_monitoring() {
+                        sec="$CLUSTER-grafana-admin-credentials"
+                        until k get secret "$sec" >/dev/null 2>&1; do
+                          check_deadline
+                          every_minute "waiting for the operator to create $sec"
+                          sleep 5
+                        done
+                        want=$(printf '%s' "${GRAFANA_PASSWORD:-}" | base64 | tr -d '\n')
+                        if [ -z "${GRAFANA_PASSWORD:-}" ]; then
+                          # an instance from an older plan version has no grafanaPassword yet: keep the
+                          # operator's random one until the parameter is set with a modify
+                          log "grafanaPassword not set; Grafana keeps its generated admin password (set grafanaPassword to choose one)"
+                        elif [ "$(k get secret "$sec" -o jsonpath='{.data.password}')" != "$want" ]; then
+                          k patch secret "$sec" --type merge -p '{"data":{"password":"'"$want"'"}}' >/dev/null
+                          log "Grafana admin password set"
+                        fi
+                        contact_host || die "can't determine the instance's endpoint name for the Grafana Ingress"
+                        host="grafana.$CONTACT_HOST"
+                        cat <<EOF | k apply -f - >/dev/null
+                      apiVersion: networking.k8s.io/v1
+                      kind: Ingress
+                      metadata:
+                        name: $CLUSTER-grafana
+                        namespace: $NS
+                        labels:
+                          omnistrate.com/instance: $CLUSTER
+                        annotations:
+                          cert-manager.io/cluster-issuer: ${GRAFANA_ISSUER:-google-public-ca}
+                          nginx.org/ssl-services: $CLUSTER-grafana
+                          external-dns.alpha.kubernetes.io/ttl: "60"
+                      spec:
+                        ingressClassName: nginx
+                        tls:
+                          - hosts: [$host]
+                            secretName: $CLUSTER-grafana-tls
+                        rules:
+                          - host: $host
+                            http:
+                              paths:
+                                - path: /
+                                  pathType: Prefix
+                                  backend:
+                                    service:
+                                      name: $CLUSTER-grafana
+                                      port:
+                                        number: 3000
+                      EOF
+                        until [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.updatedReplicas}/{.status.availableReplicas}/{.spec.replicas}' 2>/dev/null)" = 1/1/1 ] &&
+                              [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.metadata.generation}')" = "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.observedGeneration}')" ]; do
+                          check_deadline
+                          every_minute "waiting for Grafana to roll out"
+                          sleep 5
+                        done
+                        log "Grafana: https://$host (user admin)"
+                      }
+
                       case "$OP" in
                         auth) do_auth ;;
                         backup) do_backup ;;
@@ -2418,6 +2942,7 @@ services:
                         reconcile) do_reconcile ;;
                         restart) do_restart ;;
                         replace | replace-vm) do_replace ;;
+                        monitoring) do_monitoring ;;
                         *) die "unknown operation $OP" ;;
                       esac
             - name: apply-ops-sa
@@ -2530,6 +3055,34 @@ services:
                         - watch
                         - patch
                         - delete
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - secrets
+                      resourceNames:
+                        - "{{inputs.parameters.instanceId}}-grafana-admin-credentials"
+                      verbs:
+                        - get
+                        - patch
+                    - apiGroups:
+                        - networking.k8s.io
+                      resources:
+                        - ingresses
+                      verbs:
+                        - get
+                        - list
+                        - create
+                        - patch
+                        - update
+                        - delete
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      verbs:
+                        - get
+                        - list
+                        - watch
             - name: apply-ops-rolebinding
               inputs:
                 parameters:
@@ -2604,6 +3157,194 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-prometheus-sa
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+            - name: apply-prometheus-role
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - services
+                        - endpoints
+                        - pods
+                      verbs:
+                        - get
+                        - list
+                        - watch
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - configmaps
+                      verbs:
+                        - get
+                    - apiGroups:
+                        - discovery.k8s.io
+                      resources:
+                        - endpointslices
+                      verbs:
+                        - get
+                        - list
+                        - watch
+            - name: apply-prometheus-rolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-prometheus"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+            - name: apply-prometheus
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: Prometheus
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    replicas: 1
+                    serviceAccountName: "{{inputs.parameters.instanceId}}-prometheus"
+                    serviceMonitorSelector: &id001
+                      matchLabels:
+                        scylla-operator.scylladb.com/scylladbmonitoring-name: "{{inputs.parameters.instanceId}}"
+                    ruleSelector: *id001
+                    retention: 15d
+                    retentionSize: 18GB
+                    storage:
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 20Gi
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 512Mi
+                      limits:
+                        memory: 2Gi
+                    securityContext:
+                      runAsNonRoot: true
+                      runAsUser: 65534
+                      fsGroup: 65534
+                    podMetadata:
+                      labels:
+                        omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    affinity:
+                      nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          nodeSelectorTerms:
+                            - matchExpressions:
+                                - key: omnistrate.com/control-plane
+                                  operator: Exists
+                    tolerations:
+                      - key: CriticalAddonsOnly
+                        operator: Exists
+                        effect: NoSchedule
+                      - key: components.gke.io/gke-managed-components
+                        operator: Exists
+                        effect: NoSchedule
+            - name: apply-monitoring
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: scylla.scylladb.com/v1alpha1
+                  kind: ScyllaDBMonitoring
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    type: Platform
+                    endpointsSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: scylla
+                        scylla-operator.scylladb.com/scylla-service-type: member
+                        scylla/cluster: "{{inputs.parameters.instanceId}}"
+                    components:
+                      prometheus:
+                        mode: External
+                      grafana:
+                        placement:
+                          nodeAffinity:
+                            requiredDuringSchedulingIgnoredDuringExecution:
+                              nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: omnistrate.com/control-plane
+                                      operator: Exists
+                          tolerations:
+                            - key: CriticalAddonsOnly
+                              operator: Exists
+                              effect: NoSchedule
+                            - key: components.gke.io/gke-managed-components
+                              operator: Exists
+                              effect: NoSchedule
+                        resources:
+                          requests:
+                            cpu: 100m
+                            memory: 256Mi
+                          limits:
+                            memory: 1Gi
+                        datasources:
+                          - name: prometheus
+                            type: Prometheus
+                            url: "http://prometheus-operated.{{inputs.parameters.namespace}}.svc:9090"
+                            prometheusOptions: {}
             - name: apply-ops-dnsrole
               inputs:
                 parameters:
@@ -2910,6 +3651,8 @@ services:
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
+              - name: grafanaPassword
+                value: "{{ $var.grafanaPassword }}"
               - name: contactHost
                 value: "{{ $sys.network.externalClusterEndpoint }}"
               - name: backupGcsBucketName
@@ -2933,6 +3676,7 @@ services:
                   - name: planId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
@@ -2972,6 +3716,8 @@ services:
                           value: "{{inputs.parameters.adminUsername}}"
                         - name: adminPassword
                           value: "{{inputs.parameters.adminPassword}}"
+                        - name: grafanaPassword
+                          value: "{{inputs.parameters.grafanaPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
                         - name: contactHost
@@ -3032,6 +3778,53 @@ services:
                     dependencies:
                       - opssa
                       - opsclusterrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheussa
+                    template: apply-prometheus-sa
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrole
+                    template: apply-prometheus-role
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrolebinding
+                    template: apply-prometheus-rolebinding
+                    dependencies:
+                      - prometheussa
+                      - prometheusrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheus
+                    template: apply-prometheus
+                    dependencies:
+                      - prometheusrolebinding
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: monitoring
+                    template: apply-monitoring
+                    dependencies:
+                      - prometheus
                     arguments:
                       parameters:
                         - name: namespace
@@ -3148,6 +3941,35 @@ services:
                           value: "{{inputs.parameters.instanceId}}-start"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
+                  - name: deletegrafanajob
+                    template: delete-job
+                    dependencies:
+                      - restorestop
+                      - monitoring
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                  - name: grafanajob
+                    template: run-ops-job
+                    dependencies:
+                      - deletegrafanajob
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                        - name: op
+                          value: monitoring
+                        - name: arg
+                          value: ''
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                        - name: instanceType
+                          value: "{{inputs.parameters.instanceType}}"
             - name: apply-agent-config
               inputs:
                 parameters:
@@ -3196,6 +4018,7 @@ services:
                   - name: instanceId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: backupGcsBucketName
                   - name: contactHost
               resource:
@@ -3212,6 +4035,7 @@ services:
                   stringData:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
+                    GRAFANA_PASSWORD: "{{inputs.parameters.grafanaPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
                     CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
@@ -3264,6 +4088,7 @@ services:
                       #   restart        rolling restart of every member, one pod at a time
                       #   replace        replace member $ARG (fresh local volume, data re-streamed)
                       #   replace-vm     cordon member $ARG's node, then replace it onto another node
+                      #   monitoring     set the Grafana admin password and expose Grafana through an Ingress
                       # NOTE: never write a double opening brace here -- the workflow engine would
                       # try to template it.
                       set -eu
@@ -3399,8 +4224,9 @@ services:
                       # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
                       # member. The operator gives all member Services the same annotations, so this
                       # is done per member.
-                      sync_dns() {
-                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                      # Sets CONTACT_HOST (the instance's endpoint name) when the workflow couldn't
+                      # render it, and ZONE (the instance's DNS zone); returns 1 if neither is known.
+                      contact_host() {
                         if [ -z "${CONTACT_HOST:-}" ]; then
                           # restore targets get no endpoint name at render time; build Omnistrate's
                           # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
@@ -3412,9 +4238,15 @@ services:
                           [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
                         fi
                         case "${CONTACT_HOST:-}" in
-                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
-                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                          *."$CLUSTER".*) ZONE=${CONTACT_HOST#*.} ;;
+                          *) return 1 ;;
                         esac
+                      }
+
+                      sync_dns() {
+                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                        contact_host || { log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0; }
+                        zone=$ZONE
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
@@ -3634,6 +4466,67 @@ services:
                         [ -z "${node:-}" ] || log "node $node stays cordoned and is removed by the autoscaler once empty"
                       }
 
+                      # ScyllaDBMonitoring's Grafana: the operator generates its admin password and
+                      # keeps whatever the Secret holds, re-rendering Grafana when it changes; Grafana
+                      # (emptyDir storage) takes it on every start. Exposed through the cell's NGINX
+                      # Ingress at grafana.<endpoint name>, with a public certificate from cert-manager
+                      # and the name published by external-dns. Grafana itself serves HTTPS only.
+                      do_monitoring() {
+                        sec="$CLUSTER-grafana-admin-credentials"
+                        until k get secret "$sec" >/dev/null 2>&1; do
+                          check_deadline
+                          every_minute "waiting for the operator to create $sec"
+                          sleep 5
+                        done
+                        want=$(printf '%s' "${GRAFANA_PASSWORD:-}" | base64 | tr -d '\n')
+                        if [ -z "${GRAFANA_PASSWORD:-}" ]; then
+                          # an instance from an older plan version has no grafanaPassword yet: keep the
+                          # operator's random one until the parameter is set with a modify
+                          log "grafanaPassword not set; Grafana keeps its generated admin password (set grafanaPassword to choose one)"
+                        elif [ "$(k get secret "$sec" -o jsonpath='{.data.password}')" != "$want" ]; then
+                          k patch secret "$sec" --type merge -p '{"data":{"password":"'"$want"'"}}' >/dev/null
+                          log "Grafana admin password set"
+                        fi
+                        contact_host || die "can't determine the instance's endpoint name for the Grafana Ingress"
+                        host="grafana.$CONTACT_HOST"
+                        cat <<EOF | k apply -f - >/dev/null
+                      apiVersion: networking.k8s.io/v1
+                      kind: Ingress
+                      metadata:
+                        name: $CLUSTER-grafana
+                        namespace: $NS
+                        labels:
+                          omnistrate.com/instance: $CLUSTER
+                        annotations:
+                          cert-manager.io/cluster-issuer: ${GRAFANA_ISSUER:-google-public-ca}
+                          nginx.org/ssl-services: $CLUSTER-grafana
+                          external-dns.alpha.kubernetes.io/ttl: "60"
+                      spec:
+                        ingressClassName: nginx
+                        tls:
+                          - hosts: [$host]
+                            secretName: $CLUSTER-grafana-tls
+                        rules:
+                          - host: $host
+                            http:
+                              paths:
+                                - path: /
+                                  pathType: Prefix
+                                  backend:
+                                    service:
+                                      name: $CLUSTER-grafana
+                                      port:
+                                        number: 3000
+                      EOF
+                        until [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.updatedReplicas}/{.status.availableReplicas}/{.spec.replicas}' 2>/dev/null)" = 1/1/1 ] &&
+                              [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.metadata.generation}')" = "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.observedGeneration}')" ]; do
+                          check_deadline
+                          every_minute "waiting for Grafana to roll out"
+                          sleep 5
+                        done
+                        log "Grafana: https://$host (user admin)"
+                      }
+
                       case "$OP" in
                         auth) do_auth ;;
                         backup) do_backup ;;
@@ -3644,6 +4537,7 @@ services:
                         reconcile) do_reconcile ;;
                         restart) do_restart ;;
                         replace | replace-vm) do_replace ;;
+                        monitoring) do_monitoring ;;
                         *) die "unknown operation $OP" ;;
                       esac
             - name: apply-ops-sa
@@ -3756,6 +4650,34 @@ services:
                         - watch
                         - patch
                         - delete
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - secrets
+                      resourceNames:
+                        - "{{inputs.parameters.instanceId}}-grafana-admin-credentials"
+                      verbs:
+                        - get
+                        - patch
+                    - apiGroups:
+                        - networking.k8s.io
+                      resources:
+                        - ingresses
+                      verbs:
+                        - get
+                        - list
+                        - create
+                        - patch
+                        - update
+                        - delete
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      verbs:
+                        - get
+                        - list
+                        - watch
             - name: apply-ops-rolebinding
               inputs:
                 parameters:
@@ -3830,6 +4752,194 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-prometheus-sa
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+            - name: apply-prometheus-role
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - services
+                        - endpoints
+                        - pods
+                      verbs:
+                        - get
+                        - list
+                        - watch
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - configmaps
+                      verbs:
+                        - get
+                    - apiGroups:
+                        - discovery.k8s.io
+                      resources:
+                        - endpointslices
+                      verbs:
+                        - get
+                        - list
+                        - watch
+            - name: apply-prometheus-rolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-prometheus"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+            - name: apply-prometheus
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: Prometheus
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    replicas: 1
+                    serviceAccountName: "{{inputs.parameters.instanceId}}-prometheus"
+                    serviceMonitorSelector: &id001
+                      matchLabels:
+                        scylla-operator.scylladb.com/scylladbmonitoring-name: "{{inputs.parameters.instanceId}}"
+                    ruleSelector: *id001
+                    retention: 15d
+                    retentionSize: 18GB
+                    storage:
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 20Gi
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 512Mi
+                      limits:
+                        memory: 2Gi
+                    securityContext:
+                      runAsNonRoot: true
+                      runAsUser: 65534
+                      fsGroup: 65534
+                    podMetadata:
+                      labels:
+                        omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    affinity:
+                      nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          nodeSelectorTerms:
+                            - matchExpressions:
+                                - key: omnistrate.com/control-plane
+                                  operator: Exists
+                    tolerations:
+                      - key: CriticalAddonsOnly
+                        operator: Exists
+                        effect: NoSchedule
+                      - key: components.gke.io/gke-managed-components
+                        operator: Exists
+                        effect: NoSchedule
+            - name: apply-monitoring
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: scylla.scylladb.com/v1alpha1
+                  kind: ScyllaDBMonitoring
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    type: Platform
+                    endpointsSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: scylla
+                        scylla-operator.scylladb.com/scylla-service-type: member
+                        scylla/cluster: "{{inputs.parameters.instanceId}}"
+                    components:
+                      prometheus:
+                        mode: External
+                      grafana:
+                        placement:
+                          nodeAffinity:
+                            requiredDuringSchedulingIgnoredDuringExecution:
+                              nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: omnistrate.com/control-plane
+                                      operator: Exists
+                          tolerations:
+                            - key: CriticalAddonsOnly
+                              operator: Exists
+                              effect: NoSchedule
+                            - key: components.gke.io/gke-managed-components
+                              operator: Exists
+                              effect: NoSchedule
+                        resources:
+                          requests:
+                            cpu: 100m
+                            memory: 256Mi
+                          limits:
+                            memory: 1Gi
+                        datasources:
+                          - name: prometheus
+                            type: Prometheus
+                            url: "http://prometheus-operated.{{inputs.parameters.namespace}}.svc:9090"
+                            prometheusOptions: {}
             - name: apply-ops-dnsrole
               inputs:
                 parameters:
@@ -4434,8 +5544,37 @@ services:
                   - name: instanceId
               dag:
                 tasks:
+                  - name: deletegrafanaingress
+                    template: delete-ingress
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-grafana"
+                  - name: deletemonitoring
+                    template: delete-scylladbmonitoring
+                    dependencies:
+                      - deletegrafanaingress
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: deleteprometheus
+                    template: delete-prometheus
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}"
                   - name: deletecluster
                     template: delete-cluster
+                    dependencies:
+                      - deletemonitoring
+                      - deleteprometheus
                     arguments:
                       parameters:
                         - name: namespace
@@ -4512,6 +5651,36 @@ services:
                           value: "{{inputs.parameters.namespace}}"
                         - name: name
                           value: "{{inputs.parameters.instanceId}}-ops"
+                  - name: deleteprometheusrolebinding
+                    template: delete-rolebinding
+                    dependencies:
+                      - deletecluster
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-prometheus"
+                  - name: deleteprometheusrole
+                    template: delete-role
+                    dependencies:
+                      - deletecluster
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-prometheus"
+                  - name: deleteprometheussa
+                    template: delete-serviceaccount
+                    dependencies:
+                      - deletecluster
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: name
+                          value: "{{inputs.parameters.instanceId}}-prometheus"
                   - name: deletegcscredentials
                     template: delete-secret
                     dependencies:
@@ -4558,6 +5727,51 @@ services:
                           value: external-dns-ns
                         - name: name
                           value: "{{inputs.parameters.instanceId}}-ops-dns"
+            - name: delete-ingress
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: name
+              resource:
+                action: delete
+                flags:
+                  - --ignore-not-found=true
+                manifest: |
+                  apiVersion: networking.k8s.io/v1
+                  kind: Ingress
+                  metadata:
+                    name: "{{inputs.parameters.name}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+            - name: delete-scylladbmonitoring
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: name
+              resource:
+                action: delete
+                flags:
+                  - --ignore-not-found=true
+                manifest: |
+                  apiVersion: scylla.scylladb.com/v1alpha1
+                  kind: ScyllaDBMonitoring
+                  metadata:
+                    name: "{{inputs.parameters.name}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+            - name: delete-prometheus
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: name
+              resource:
+                action: delete
+                flags:
+                  - --ignore-not-found=true
+                manifest: |
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: Prometheus
+                  metadata:
+                    name: "{{inputs.parameters.name}}"
+                    namespace: "{{inputs.parameters.namespace}}"
             - name: delete-cluster
               inputs:
                 parameters:
@@ -5057,6 +6271,8 @@ services:
                 value: "{{ $var.adminUsername }}"
               - name: adminPassword
                 value: "{{ $var.adminPassword }}"
+              - name: grafanaPassword
+                value: "{{ $var.grafanaPassword }}"
               - name: contactHost
                 value: ''
               - name: backupGcsBucketName
@@ -5082,6 +6298,7 @@ services:
                   - name: planId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: contactHost
                   - name: backupGcsBucketName
                   - name: backupGcsCredentials
@@ -5122,6 +6339,8 @@ services:
                           value: "{{inputs.parameters.adminUsername}}"
                         - name: adminPassword
                           value: "{{inputs.parameters.adminPassword}}"
+                        - name: grafanaPassword
+                          value: "{{inputs.parameters.grafanaPassword}}"
                         - name: backupGcsBucketName
                           value: "{{inputs.parameters.backupGcsBucketName}}"
                         - name: contactHost
@@ -5182,6 +6401,53 @@ services:
                     dependencies:
                       - opssa
                       - opsclusterrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheussa
+                    template: apply-prometheus-sa
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrole
+                    template: apply-prometheus-role
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheusrolebinding
+                    template: apply-prometheus-rolebinding
+                    dependencies:
+                      - prometheussa
+                      - prometheusrole
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: prometheus
+                    template: apply-prometheus
+                    dependencies:
+                      - prometheusrolebinding
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                  - name: monitoring
+                    template: apply-monitoring
+                    dependencies:
+                      - prometheus
                     arguments:
                       parameters:
                         - name: namespace
@@ -5298,6 +6564,35 @@ services:
                           value: "{{inputs.parameters.instanceId}}-restore"
                         - name: instanceType
                           value: "{{inputs.parameters.instanceType}}"
+                  - name: deletegrafanajob
+                    template: delete-job
+                    dependencies:
+                      - restoresnapshot
+                      - monitoring
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                  - name: grafanajob
+                    template: run-ops-job
+                    dependencies:
+                      - deletegrafanajob
+                    arguments:
+                      parameters:
+                        - name: namespace
+                          value: "{{inputs.parameters.namespace}}"
+                        - name: instanceId
+                          value: "{{inputs.parameters.instanceId}}"
+                        - name: op
+                          value: monitoring
+                        - name: arg
+                          value: ''
+                        - name: jobName
+                          value: "{{inputs.parameters.instanceId}}-monitoring"
+                        - name: instanceType
+                          value: "{{inputs.parameters.instanceType}}"
             - name: apply-agent-config
               inputs:
                 parameters:
@@ -5346,6 +6641,7 @@ services:
                   - name: instanceId
                   - name: adminUsername
                   - name: adminPassword
+                  - name: grafanaPassword
                   - name: backupGcsBucketName
                   - name: contactHost
               resource:
@@ -5362,6 +6658,7 @@ services:
                   stringData:
                     ADMIN_USER: "{{inputs.parameters.adminUsername}}"
                     ADMIN_PASSWORD: "{{inputs.parameters.adminPassword}}"
+                    GRAFANA_PASSWORD: "{{inputs.parameters.grafanaPassword}}"
                     LOCATION: "gcs:{{inputs.parameters.backupGcsBucketName}}"
                     CONTACT_HOST: "{{inputs.parameters.contactHost}}"
             - name: apply-scylla-config
@@ -5414,6 +6711,7 @@ services:
                       #   restart        rolling restart of every member, one pod at a time
                       #   replace        replace member $ARG (fresh local volume, data re-streamed)
                       #   replace-vm     cordon member $ARG's node, then replace it onto another node
+                      #   monitoring     set the Grafana admin password and expose Grafana through an Ingress
                       # NOTE: never write a double opening brace here -- the workflow engine would
                       # try to template it.
                       set -eu
@@ -5549,8 +6847,9 @@ services:
                       # the CQL endpoint): it goes to member 0, node-<n>.<instance zone> to every
                       # member. The operator gives all member Services the same annotations, so this
                       # is done per member.
-                      sync_dns() {
-                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                      # Sets CONTACT_HOST (the instance's endpoint name) when the workflow couldn't
+                      # render it, and ZONE (the instance's DNS zone); returns 1 if neither is known.
+                      contact_host() {
                         if [ -z "${CONTACT_HOST:-}" ]; then
                           # restore targets get no endpoint name at render time; build Omnistrate's
                           # r-<resource id>.<instance>.<cell zone>, the zone being external-dns's domain filter
@@ -5562,9 +6861,15 @@ services:
                           [ -z "$cell_zone" ] || [ -z "$rid" ] || CONTACT_HOST="$rid.$CLUSTER.$cell_zone"
                         fi
                         case "${CONTACT_HOST:-}" in
-                          *."$CLUSTER".*) zone=${CONTACT_HOST#*.} ;;
-                          *) log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0 ;;
+                          *."$CLUSTER".*) ZONE=${CONTACT_HOST#*.} ;;
+                          *) return 1 ;;
                         esac
+                      }
+
+                      sync_dns() {
+                        [ "$(sc '{.spec.exposeOptions.nodeService.type}')" = LoadBalancer ] || return 0
+                        contact_host || { log "warning: endpoint name '${CONTACT_HOST:-}' is not in the instance's DNS zone; member load balancers keep only their cloud names"; return 0; }
+                        zone=$ZONE
                         for p in $(members); do
                           n=${p##*-}
                           h="node-$n.$zone"
@@ -5784,6 +7089,67 @@ services:
                         [ -z "${node:-}" ] || log "node $node stays cordoned and is removed by the autoscaler once empty"
                       }
 
+                      # ScyllaDBMonitoring's Grafana: the operator generates its admin password and
+                      # keeps whatever the Secret holds, re-rendering Grafana when it changes; Grafana
+                      # (emptyDir storage) takes it on every start. Exposed through the cell's NGINX
+                      # Ingress at grafana.<endpoint name>, with a public certificate from cert-manager
+                      # and the name published by external-dns. Grafana itself serves HTTPS only.
+                      do_monitoring() {
+                        sec="$CLUSTER-grafana-admin-credentials"
+                        until k get secret "$sec" >/dev/null 2>&1; do
+                          check_deadline
+                          every_minute "waiting for the operator to create $sec"
+                          sleep 5
+                        done
+                        want=$(printf '%s' "${GRAFANA_PASSWORD:-}" | base64 | tr -d '\n')
+                        if [ -z "${GRAFANA_PASSWORD:-}" ]; then
+                          # an instance from an older plan version has no grafanaPassword yet: keep the
+                          # operator's random one until the parameter is set with a modify
+                          log "grafanaPassword not set; Grafana keeps its generated admin password (set grafanaPassword to choose one)"
+                        elif [ "$(k get secret "$sec" -o jsonpath='{.data.password}')" != "$want" ]; then
+                          k patch secret "$sec" --type merge -p '{"data":{"password":"'"$want"'"}}' >/dev/null
+                          log "Grafana admin password set"
+                        fi
+                        contact_host || die "can't determine the instance's endpoint name for the Grafana Ingress"
+                        host="grafana.$CONTACT_HOST"
+                        cat <<EOF | k apply -f - >/dev/null
+                      apiVersion: networking.k8s.io/v1
+                      kind: Ingress
+                      metadata:
+                        name: $CLUSTER-grafana
+                        namespace: $NS
+                        labels:
+                          omnistrate.com/instance: $CLUSTER
+                        annotations:
+                          cert-manager.io/cluster-issuer: ${GRAFANA_ISSUER:-google-public-ca}
+                          nginx.org/ssl-services: $CLUSTER-grafana
+                          external-dns.alpha.kubernetes.io/ttl: "60"
+                      spec:
+                        ingressClassName: nginx
+                        tls:
+                          - hosts: [$host]
+                            secretName: $CLUSTER-grafana-tls
+                        rules:
+                          - host: $host
+                            http:
+                              paths:
+                                - path: /
+                                  pathType: Prefix
+                                  backend:
+                                    service:
+                                      name: $CLUSTER-grafana
+                                      port:
+                                        number: 3000
+                      EOF
+                        until [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.updatedReplicas}/{.status.availableReplicas}/{.spec.replicas}' 2>/dev/null)" = 1/1/1 ] &&
+                              [ "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.metadata.generation}')" = "$(k get deploy "$CLUSTER-grafana" -o jsonpath='{.status.observedGeneration}')" ]; do
+                          check_deadline
+                          every_minute "waiting for Grafana to roll out"
+                          sleep 5
+                        done
+                        log "Grafana: https://$host (user admin)"
+                      }
+
                       case "$OP" in
                         auth) do_auth ;;
                         backup) do_backup ;;
@@ -5794,6 +7160,7 @@ services:
                         reconcile) do_reconcile ;;
                         restart) do_restart ;;
                         replace | replace-vm) do_replace ;;
+                        monitoring) do_monitoring ;;
                         *) die "unknown operation $OP" ;;
                       esac
             - name: apply-ops-sa
@@ -5906,6 +7273,34 @@ services:
                         - watch
                         - patch
                         - delete
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - secrets
+                      resourceNames:
+                        - "{{inputs.parameters.instanceId}}-grafana-admin-credentials"
+                      verbs:
+                        - get
+                        - patch
+                    - apiGroups:
+                        - networking.k8s.io
+                      resources:
+                        - ingresses
+                      verbs:
+                        - get
+                        - list
+                        - create
+                        - patch
+                        - update
+                        - delete
+                    - apiGroups:
+                        - apps
+                      resources:
+                        - deployments
+                      verbs:
+                        - get
+                        - list
+                        - watch
             - name: apply-ops-rolebinding
               inputs:
                 parameters:
@@ -5980,6 +7375,194 @@ services:
                     apiGroup: rbac.authorization.k8s.io
                     kind: ClusterRole
                     name: "{{inputs.parameters.instanceId}}-ops"
+            - name: apply-prometheus-sa
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+            - name: apply-prometheus-role
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: Role
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  rules:
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - services
+                        - endpoints
+                        - pods
+                      verbs:
+                        - get
+                        - list
+                        - watch
+                    - apiGroups:
+                        - ''
+                      resources:
+                        - configmaps
+                      verbs:
+                        - get
+                    - apiGroups:
+                        - discovery.k8s.io
+                      resources:
+                        - endpointslices
+                      verbs:
+                        - get
+                        - list
+                        - watch
+            - name: apply-prometheus-rolebinding
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: RoleBinding
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  subjects:
+                    - kind: ServiceAccount
+                      name: "{{inputs.parameters.instanceId}}-prometheus"
+                      namespace: "{{inputs.parameters.namespace}}"
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: Role
+                    name: "{{inputs.parameters.instanceId}}-prometheus"
+            - name: apply-prometheus
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: monitoring.coreos.com/v1
+                  kind: Prometheus
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    replicas: 1
+                    serviceAccountName: "{{inputs.parameters.instanceId}}-prometheus"
+                    serviceMonitorSelector: &id001
+                      matchLabels:
+                        scylla-operator.scylladb.com/scylladbmonitoring-name: "{{inputs.parameters.instanceId}}"
+                    ruleSelector: *id001
+                    retention: 15d
+                    retentionSize: 18GB
+                    storage:
+                      volumeClaimTemplate:
+                        spec:
+                          accessModes:
+                            - ReadWriteOnce
+                          resources:
+                            requests:
+                              storage: 20Gi
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 512Mi
+                      limits:
+                        memory: 2Gi
+                    securityContext:
+                      runAsNonRoot: true
+                      runAsUser: 65534
+                      fsGroup: 65534
+                    podMetadata:
+                      labels:
+                        omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                    affinity:
+                      nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          nodeSelectorTerms:
+                            - matchExpressions:
+                                - key: omnistrate.com/control-plane
+                                  operator: Exists
+                    tolerations:
+                      - key: CriticalAddonsOnly
+                        operator: Exists
+                        effect: NoSchedule
+                      - key: components.gke.io/gke-managed-components
+                        operator: Exists
+                        effect: NoSchedule
+            - name: apply-monitoring
+              inputs:
+                parameters:
+                  - name: namespace
+                  - name: instanceId
+              resource:
+                action: apply
+                manifest: |
+                  apiVersion: scylla.scylladb.com/v1alpha1
+                  kind: ScyllaDBMonitoring
+                  metadata:
+                    name: "{{inputs.parameters.instanceId}}"
+                    namespace: "{{inputs.parameters.namespace}}"
+                    labels:
+                      omnistrate.com/instance: "{{inputs.parameters.instanceId}}"
+                  spec:
+                    type: Platform
+                    endpointsSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: scylla
+                        scylla-operator.scylladb.com/scylla-service-type: member
+                        scylla/cluster: "{{inputs.parameters.instanceId}}"
+                    components:
+                      prometheus:
+                        mode: External
+                      grafana:
+                        placement:
+                          nodeAffinity:
+                            requiredDuringSchedulingIgnoredDuringExecution:
+                              nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: omnistrate.com/control-plane
+                                      operator: Exists
+                          tolerations:
+                            - key: CriticalAddonsOnly
+                              operator: Exists
+                              effect: NoSchedule
+                            - key: components.gke.io/gke-managed-components
+                              operator: Exists
+                              effect: NoSchedule
+                        resources:
+                          requests:
+                            cpu: 100m
+                            memory: 256Mi
+                          limits:
+                            memory: 1Gi
+                        datasources:
+                          - name: prometheus
+                            type: Prometheus
+                            url: "http://prometheus-operated.{{inputs.parameters.namespace}}.svc:9090"
+                            prometheusOptions: {}
             - name: apply-ops-dnsrole
               inputs:
                 parameters:
@@ -6261,6 +7844,12 @@ services:
           - 9042
           - 19042
         primary: true
+        networkingType: PUBLIC
+      grafana:
+        host: "grafana.{{ $sys.network.externalClusterEndpoint }}"
+        ports:
+          - 443
+        primary: false
         networkingType: PUBLIC
     dependsOn:
       - nlbFirewall
